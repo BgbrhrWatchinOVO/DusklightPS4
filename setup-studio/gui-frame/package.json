@@ -1,0 +1,9 @@
+{
+  "name": "dusklight-setup-studio",
+  "productName": "Dusklight Setup Studio",
+  "version": "0.2.0",
+  "description": "Puts Dusklight with your own copy of the game on your PS4",
+  "license": "MIT",
+  "main": "main.js",
+  "private": true
+}
