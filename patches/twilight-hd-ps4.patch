@@ -1,0 +1,107 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index 9e6eb48..c61d0bf 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -115,12 +115,23 @@ ModResult register_config(ModError* error) {
+             svc_config->get_bool(mod_ctx, s_featureHandles[i], &s_activeFeatures[i]) != MOD_OK)
+             return mods::set_error(error, MOD_ERROR, "failed to register feature settings");
+     }
+-    if (register_int("button-layout", static_cast<int64_t>(ButtonLayout::Nintendo),
++#if defined(__ORBIS__)
++    // The PS4 build maps Circle to A and Cross to B, the PlayStation layout's positions.
++    constexpr ButtonLayout kDefaultLayout = ButtonLayout::PlayStation;
++    constexpr ButtonStyle kDefaultStyle = ButtonStyle::PlayStationColors;
++    // The Wii U layout, as Cemu plays it: L1 Midna, L2/R2 the triggers, R1 the third item.
++    constexpr ControllerCompatibility kDefaultCompatibility = ControllerCompatibility::FixedTphd;
++#else
++    constexpr ButtonLayout kDefaultLayout = ButtonLayout::Nintendo;
++    constexpr ButtonStyle kDefaultStyle = ButtonStyle::Silver;
++    constexpr ControllerCompatibility kDefaultCompatibility = ControllerCompatibility::FollowDusklight;
++#endif
++    if (register_int("button-layout", static_cast<int64_t>(kDefaultLayout),
+             s_buttonLayout) != MOD_OK ||
+-        register_int("button-style", static_cast<int64_t>(ButtonStyle::Silver),
++        register_int("button-style", static_cast<int64_t>(kDefaultStyle),
+             s_buttonStyle) != MOD_OK ||
+         register_int("controller-compatibility",
+-            static_cast<int64_t>(ControllerCompatibility::FollowDusklight),
++            static_cast<int64_t>(kDefaultCompatibility),
+             s_controllerCompatibility) != MOD_OK ||
+         register_hud_sizes() != MOD_OK ||
+         register_int("action-text-percent", 100, s_actionTextSize) != MOD_OK ||
+@@ -130,7 +141,12 @@ ModResult register_config(ModError* error) {
+         register_int("text-font", 0, s_textFont) != MOD_OK ||
+         register_int("items-screen", 0, s_itemsScreen) != MOD_OK ||
+         register_menu_swap() != MOD_OK ||
++#if defined(__ORBIS__)
++        // Releases carry no PS4 build of the mod: its code is linked into the game.
++        register_bool("check-for-updates", false, s_checkForUpdates) != MOD_OK ||
++#else
+         register_bool("check-for-updates", true, s_checkForUpdates) != MOD_OK ||
++#endif
+         register_bool("combined-map-control", true, s_combinedMap) != MOD_OK ||
+         register_bool("wolf-touch-icons", true, s_wolfTouchIcons) != MOD_OK)
+     {
+diff --git a/src/item_bank_screen.inc b/src/item_bank_screen.inc
+index 0e46e01..a8f3b27 100644
+--- a/src/item_bank_screen.inc
++++ b/src/item_bank_screen.inc
+@@ -93,6 +93,17 @@ const char* item_bank_source_text(J2DScreen* screen, u64 western, u64 japanese)
+     return "";
+ }
+ 
++// The selected item's name, from the text box the game writes it to (dMenu_Ring_c::setNameString):
++// the Japanese one on Japanese and early Wii Japanese discs, the western one otherwise. The other
++// set keeps the layout's placeholder ("Sac de bombes prete" on PAL discs) and is not reliably
++// hidden, so visibility cannot choose between them.
++const char* item_bank_name_text(dMenu_Ring_c* ring) {
++    if (ring->mpCenterScreen == nullptr) return "";
++    const u64 tag = dusk::version::isJpnOrLessThanWiiJpn() ? MULTI_CHAR('item_n04') : MULTI_CHAR('fitem_n1');
++    auto* source = static_cast<J2DTextBox*>(ring->mpCenterScreen->search(tag));
++    return source != nullptr ? text_box_string(source) : "";
++}
++
+ void create_item_bank(dMenu_Ring_c* ring) {
+     destroy_item_bank();
+     if (!item_bank_enabled() || ring == nullptr || ring->mpScreen == nullptr ||
+@@ -330,8 +341,7 @@ void draw_item_bank(dMenu_Ring_c* ring) {
+         root->scale(viewport.scale, viewport.scale);
+         root->move(viewport.left, viewport.top);
+         root->setAlpha(alpha);
+-        copy_item_bank_text(s_itemBank.name, item_bank_source_text(ring->mpCenterScreen,
+-            MULTI_CHAR('fitem_n1'), MULTI_CHAR('item_n04')));
++        copy_item_bank_text(s_itemBank.name, item_bank_name_text(ring));
+         const bool prompts = show_ring_assignment_prompts(ring->mPlayerIsWolf, ring->mpItemExplain->getStatus());
+         // Native assignment messages can contain a line break. The bank has
+         // one prompt row, so flatten it rather than drawing both lines on top.
+diff --git a/src/item_slot_hooks.cpp b/src/item_slot_hooks.cpp
+index 1052b81..f5a2e22 100644
+--- a/src/item_slot_hooks.cpp
++++ b/src/item_slot_hooks.cpp
+@@ -108,6 +108,7 @@ class TouchControls;
+ #include "mods/svc/hook.hpp"
+ #include "mods/svc/resource.h"
+ #include "dusk/menu_pointer.h"
++#include "dusk/version.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+diff --git a/src/update_service.cpp b/src/update_service.cpp
+index 7f7a99a..3ae4ee2 100644
+--- a/src/update_service.cpp
++++ b/src/update_service.cpp
+@@ -241,7 +241,13 @@ void confirm_update(ModContext*, UiDialogHandle, void*) {
+ void request_update_check(ModContext*, void* userData) {
+     State expected = State::Idle;
+     if (!s_state.compare_exchange_strong(expected, State::Checking)) return;
+-    if (svc_http == nullptr) {
++#if defined(__ORBIS__)
++    // The PS4 build links the mod into the game, so a downloaded release cannot replace it.
++    constexpr bool kCanUpdate = false;
++#else
++    constexpr bool kCanUpdate = true;
++#endif
++    if (svc_http == nullptr || !kCanUpdate) {
+         s_result = {};
+         s_result.manual = userData != nullptr;
+         finish_request(State::CheckReady);

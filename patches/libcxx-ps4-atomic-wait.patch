@@ -1,0 +1,52 @@
+--- a/atomic.cpp
++++ b/atomic.cpp
+@@ -34,6 +34,13 @@
+ 
+ #  define _LIBCPP_FUTEX(...) syscall(SYS_futex, __VA_ARGS__)
+ 
++#elif defined(__PS4__)
++
++// The PS4 has no _umtx_op for applications: waits block on condition variables (kernel waits),
++// one per hashed address, instead of the baseline's polling with sleeps.
++#  include <condition_variable>
++#  include <mutex>
++
+ #elif defined(__OpenBSD__)
+ 
+ #  include <sys/futex.h>
+@@ -101,6 +108,35 @@
+   _umtx_op(const_cast<__cxx_atomic_contention_t*>(__ptr), UMTX_OP_WAKE, __notify_one ? 1 : INT_MAX, nullptr, nullptr);
+ }
+ 
++#elif defined(__PS4__)
++
++struct alignas(64) __libcpp_ps4_wait_bucket {
++  mutex __mutex;
++  condition_variable __cv;
++};
++static __libcpp_ps4_wait_bucket __libcpp_ps4_wait_buckets[64];
++
++static __libcpp_ps4_wait_bucket& __libcpp_ps4_bucket(void const volatile* __ptr) {
++  return __libcpp_ps4_wait_buckets[(reinterpret_cast<uintptr_t>(__ptr) >> 6) % 64];
++}
++
++static void
++__libcpp_platform_wait_on_address(__cxx_atomic_contention_t const volatile* __ptr, __cxx_contention_t __val) {
++  auto& __bucket = __libcpp_ps4_bucket(__ptr);
++  unique_lock<mutex> __lock(__bucket.__mutex);
++  // The waker changes the value before it takes the mutex, so checking under the mutex cannot
++  // miss a wake. Bounded like the futex wait; callers re-check the value.
++  if (__cxx_nonatomic_compare_equal(__cxx_atomic_load(__ptr, memory_order_seq_cst), __val))
++    __bucket.__cv.wait_for(__lock, chrono::seconds(2));
++}
++
++static void __libcpp_platform_wake_by_address(__cxx_atomic_contention_t const volatile* __ptr, bool) {
++  auto& __bucket = __libcpp_ps4_bucket(__ptr);
++  // Addresses share buckets: wake every waiter of the bucket.
++  lock_guard<mutex> __lock(__bucket.__mutex);
++  __bucket.__cv.notify_all();
++}
++
+ #else // <- Add other operating systems here
+ 
+ // Baseline is just a timed backoff

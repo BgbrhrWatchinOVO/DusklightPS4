@@ -1,0 +1,929 @@
+diff --git a/include/dolphin/gd/GDBase.h b/include/dolphin/gd/GDBase.h
+index b25732ea526..3c5bf06d654 100644
+--- a/include/dolphin/gd/GDBase.h
++++ b/include/dolphin/gd/GDBase.h
+@@ -51,37 +51,34 @@ inline static void GDWrite_u8(u8 data) {
+     __GDWrite(data);
+ }
+ 
++/* The bytes of a big-endian value at the write pointer, moved once: written byte by byte through
++ * __GDWrite, each store may alias the list object, so the pointer is reloaded and stored per byte. */
++inline static void __GDWriteBE(u64 data, u32 bytes) {
++    u8* ptr = __GDCurrentDL->ptr;
++    for (u32 i = 0; i < bytes; i++) {
++        ptr[i] = (u8)(data >> (8 * (bytes - 1 - i)));
++    }
++    __GDCurrentDL->ptr = ptr + bytes;
++}
++
+ inline static void GDWrite_u16(u16 data) {
+     GDOverflowCheck(sizeof(u16));
+-    __GDWrite((u8)((data >> 8)));
+-    __GDWrite((u8)((data >> 0) & 0xFF));
++    __GDWriteBE(data, 2);
+ }
+ 
+ inline static void GDWrite_u24(u32 data) {
+     GDOverflowCheck(3);
+-    __GDWrite((u8)((data >> 16) & 0xFF));
+-    __GDWrite((u8)((data >> 8) & 0xFF));
+-    __GDWrite((u8)((data >> 0) & 0xFF));
++    __GDWriteBE(data & 0xFFFFFF, 3);
+ }
+ 
+ inline static void GDWrite_u32(u32 data) {
+     GDOverflowCheck(sizeof(u32));
+-    __GDWrite((u8)((data >> 24) & 0xFF));
+-    __GDWrite((u8)((data >> 16) & 0xFF));
+-    __GDWrite((u8)((data >> 8) & 0xFF));
+-    __GDWrite((u8)((data >> 0) & 0xFF));
++    __GDWriteBE(data, 4);
+ }
+ 
+ inline static void GDWrite_u64(u64 data) {
+   GDOverflowCheck(sizeof(u64));
+-  __GDWrite((u8)((data >> 56) & 0xFF));
+-  __GDWrite((u8)((data >> 48) & 0xFF));
+-  __GDWrite((u8)((data >> 40) & 0xFF));
+-  __GDWrite((u8)((data >> 32) & 0xFF));
+-  __GDWrite((u8)((data >> 24) & 0xFF));
+-  __GDWrite((u8)((data >> 16) & 0xFF));
+-  __GDWrite((u8)((data >> 8) & 0xFF));
+-  __GDWrite((u8)((data >> 0) & 0xFF));
++  __GDWriteBE(data, 8);
+ }
+ 
+ inline static void GDWrite_f32(f32 data) {
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index bd48247c3a3..142560ec8fb 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -31,10 +31,18 @@
+ #include "system_info.hpp"
+ #include "tracy/Tracy.hpp"
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ extern "C" void ps5_input_poll();
+ extern "C" double now_seconds();
+ #endif
++#if defined(__ORBIS__)
++// The PS4 shell's splash stays until the first frame is presented (ps4/native/platform.c).
++extern "C" void ps4_hide_splash(void);
++#ifndef PS4_DEV_TOOLS
++#define PS4_DEV_TOOLS 1
++#endif
++#endif
++
+ namespace aurora {
+ AuroraConfig g_config;
+ uint32_t g_sdlCustomEventsStart;
+@@ -234,7 +242,7 @@ const AuroraEvent* update() noexcept {
+ #ifdef AURORA_ENABLE_GX
+   gx::update();
+ #endif
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+   ps5_input_poll();
+ #endif
+   return window::poll_events();
+@@ -391,12 +399,15 @@ void end_frame() noexcept {
+         }
+       }
+       if (status) {
+-#ifdef __PROSPERO__
++#if defined(__ORBIS__)
++        ps4_hide_splash();
++#endif
++#if defined(__PROSPERO__) || (defined(__ORBIS__) && PS4_DEV_TOOLS)
+         static unsigned measuredFrames = 0;
+         static double measuredStart = now_seconds();
+         if (++measuredFrames == 300) {
+           const double elapsed = now_seconds() - measuredStart;
+-          std::fprintf(stderr, "[Aurora PS5] Presented %u frames in %.3f s: %.2f FPS\n", measuredFrames, elapsed, measuredFrames / elapsed);
++          std::fprintf(stderr, "[Aurora] Presented %u frames in %.3f s: %.2f FPS\n", measuredFrames, elapsed, measuredFrames / elapsed);
+           measuredFrames = 0;
+           measuredStart = now_seconds();
+         }
+diff --git a/lib/dawn/BackendBinding.cpp b/lib/dawn/BackendBinding.cpp
+index 4a2e1575eaa..bde6b95a017 100644
+--- a/lib/dawn/BackendBinding.cpp
++++ b/lib/dawn/BackendBinding.cpp
+@@ -15,11 +15,11 @@ namespace utils {
+ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window);
+ 
+ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window) {
+-#if defined(__PROSPERO__)
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+   auto desc = std::make_shared<wgpu::SurfaceSourceDirectDisplay>();
+   int width = 0, height = 0;
+   SDL_GetWindowSizeInPixels(window, &width, &height);
+-  std::fprintf(stderr, "[Aurora PS5] Surface requested: %d x %d\n", width, height);
++  std::fprintf(stderr, "[Aurora] Surface requested: %d x %d\n", width, height);
+   desc->width = width;
+   desc->height = height;
+   return desc;
+diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
+index 94481a4dfa8..b020ff887fa 100644
+--- a/lib/dolphin/dvd/dvd.cpp
++++ b/lib/dolphin/dvd/dvd.cpp
+@@ -221,6 +221,7 @@ std::string build_path(FstIndex fstIndex) {
+ }
+ 
+ s32 readFromHandle(CommandDataBase* handle, void* out, s32 length, s32 offset, u32* transferredOut) {
++  ZoneScopedN("dvd: read");
+   if (transferredOut != nullptr) {
+     *transferredOut = 0;
+   }
+@@ -498,6 +499,9 @@ private:
+ 
+     std::unique_lock lk{m_mutex};
+     while (true) {
++#ifdef PS4ProfThreadBusy
++      PS4ProfThreadBusy("aurora dvd");
++#endif
+       m_cv.wait(lk, [&] { return m_shutdown || !m_queue.empty(); });
+       if (m_shutdown) {
+         return;
+diff --git a/lib/dolphin/gx/GXVert.cpp b/lib/dolphin/gx/GXVert.cpp
+index 789ed141cd9..f138f10dbf7 100644
+--- a/lib/dolphin/gx/GXVert.cpp
++++ b/lib/dolphin/gx/GXVert.cpp
+@@ -92,58 +92,43 @@ void GXEnd() {
+ }
+ 
+ void GXPosition3f32(f32 x, f32 y, f32 z) {
+-  GX_WRITE_F32(x);
+-  GX_WRITE_F32(y);
+-  GX_WRITE_F32(z);
++  aurora::gx::fifo::write_values(x, y, z);
+ }
+ 
+ void GXPosition3u16(u16 x, u16 y, u16 z) {
+-  GX_WRITE_U16(x);
+-  GX_WRITE_U16(y);
+-  GX_WRITE_U16(z);
++  aurora::gx::fifo::write_values(x, y, z);
+ }
+ 
+ void GXPosition3s16(s16 x, s16 y, s16 z) {
+-  GX_WRITE_U16(static_cast<u16>(x));
+-  GX_WRITE_U16(static_cast<u16>(y));
+-  GX_WRITE_U16(static_cast<u16>(z));
++  aurora::gx::fifo::write_values(static_cast<u16>(x), static_cast<u16>(y), static_cast<u16>(z));
+ }
+ 
+ void GXPosition3u8(u8 x, u8 y, u8 z) {
+-  GX_WRITE_U8(x);
+-  GX_WRITE_U8(y);
+-  GX_WRITE_U8(z);
++  aurora::gx::fifo::write_values(x, y, z);
+ }
+ 
+ void GXPosition3s8(s8 x, s8 y, s8 z) {
+-  GX_WRITE_U8(static_cast<u8>(x));
+-  GX_WRITE_U8(static_cast<u8>(y));
+-  GX_WRITE_U8(static_cast<u8>(z));
++  aurora::gx::fifo::write_values(static_cast<u8>(x), static_cast<u8>(y), static_cast<u8>(z));
+ }
+ 
+ void GXPosition2f32(f32 x, f32 y) {
+-  GX_WRITE_F32(x);
+-  GX_WRITE_F32(y);
++  aurora::gx::fifo::write_values(x, y);
+ }
+ 
+ void GXPosition2u16(u16 x, u16 y) {
+-  GX_WRITE_U16(x);
+-  GX_WRITE_U16(y);
++  aurora::gx::fifo::write_values(x, y);
+ }
+ 
+ void GXPosition2s16(s16 x, s16 y) {
+-  GX_WRITE_U16(static_cast<u16>(x));
+-  GX_WRITE_U16(static_cast<u16>(y));
++  aurora::gx::fifo::write_values(static_cast<u16>(x), static_cast<u16>(y));
+ }
+ 
+ void GXPosition2u8(u8 x, u8 y) {
+-  GX_WRITE_U8(x);
+-  GX_WRITE_U8(y);
++  aurora::gx::fifo::write_values(x, y);
+ }
+ 
+ void GXPosition2s8(s8 x, s8 y) {
+-  GX_WRITE_U8(static_cast<u8>(x));
+-  GX_WRITE_U8(static_cast<u8>(y));
++  aurora::gx::fifo::write_values(static_cast<u8>(x), static_cast<u8>(y));
+ }
+ 
+ void GXPosition1x16(u16 idx) { GX_WRITE_U16(idx); }
+@@ -151,21 +136,15 @@ void GXPosition1x16(u16 idx) { GX_WRITE_U16(idx); }
+ void GXPosition1x8(u8 idx) { GX_WRITE_U8(idx); }
+ 
+ void GXNormal3f32(f32 x, f32 y, f32 z) {
+-  GX_WRITE_F32(x);
+-  GX_WRITE_F32(y);
+-  GX_WRITE_F32(z);
++  aurora::gx::fifo::write_values(x, y, z);
+ }
+ 
+ void GXNormal3s16(s16 x, s16 y, s16 z) {
+-  GX_WRITE_U16(static_cast<u16>(x));
+-  GX_WRITE_U16(static_cast<u16>(y));
+-  GX_WRITE_U16(static_cast<u16>(z));
++  aurora::gx::fifo::write_values(static_cast<u16>(x), static_cast<u16>(y), static_cast<u16>(z));
+ }
+ 
+ void GXNormal3s8(s8 x, s8 y, s8 z) {
+-  GX_WRITE_U8(static_cast<u8>(x));
+-  GX_WRITE_U8(static_cast<u8>(y));
+-  GX_WRITE_U8(static_cast<u8>(z));
++  aurora::gx::fifo::write_values(static_cast<u8>(x), static_cast<u8>(y), static_cast<u8>(z));
+ }
+ 
+ void GXNormal1x16(u16 index) { GX_WRITE_U16(index); }
+@@ -173,23 +152,16 @@ void GXNormal1x16(u16 index) { GX_WRITE_U16(index); }
+ void GXNormal1x8(u8 index) { GX_WRITE_U8(index); }
+ 
+ void GXColor4f32(f32 r, f32 g, f32 b, f32 a) {
+-  GX_WRITE_U8(static_cast<u8>(r * 255.0));
+-  GX_WRITE_U8(static_cast<u8>(g * 255.0));
+-  GX_WRITE_U8(static_cast<u8>(b * 255.0));
+-  GX_WRITE_U8(static_cast<u8>(a * 255.0));
++  aurora::gx::fifo::write_values(static_cast<u8>(r * 255.0), static_cast<u8>(g * 255.0), static_cast<u8>(b * 255.0),
++                                 static_cast<u8>(a * 255.0));
+ }
+ 
+ void GXColor4u8(u8 r, u8 g, u8 b, u8 a) {
+-  GX_WRITE_U8(r);
+-  GX_WRITE_U8(g);
+-  GX_WRITE_U8(b);
+-  GX_WRITE_U8(a);
++  aurora::gx::fifo::write_values(r, g, b, a);
+ }
+ 
+ void GXColor3u8(u8 r, u8 g, u8 b) {
+-  GX_WRITE_U8(r);
+-  GX_WRITE_U8(g);
+-  GX_WRITE_U8(b);
++  aurora::gx::fifo::write_values(r, g, b);
+ }
+ 
+ void GXColor1u32(u32 clr) { GX_WRITE_U32(clr); }
+@@ -201,28 +173,23 @@ void GXColor1x16(u16 index) { GX_WRITE_U16(index); }
+ void GXColor1x8(u8 index) { GX_WRITE_U8(index); }
+ 
+ void GXTexCoord2f32(f32 s, f32 t) {
+-  GX_WRITE_F32(s);
+-  GX_WRITE_F32(t);
++  aurora::gx::fifo::write_values(s, t);
+ }
+ 
+ void GXTexCoord2u16(u16 s, u16 t) {
+-  GX_WRITE_U16(s);
+-  GX_WRITE_U16(t);
++  aurora::gx::fifo::write_values(s, t);
+ }
+ 
+ void GXTexCoord2s16(s16 s, s16 t) {
+-  GX_WRITE_U16(static_cast<u16>(s));
+-  GX_WRITE_U16(static_cast<u16>(t));
++  aurora::gx::fifo::write_values(static_cast<u16>(s), static_cast<u16>(t));
+ }
+ 
+ void GXTexCoord2u8(u8 s, u8 t) {
+-  GX_WRITE_U8(s);
+-  GX_WRITE_U8(t);
++  aurora::gx::fifo::write_values(s, t);
+ }
+ 
+ void GXTexCoord2s8(s8 s, s8 t) {
+-  GX_WRITE_U8(static_cast<u8>(s));
+-  GX_WRITE_U8(static_cast<u8>(t));
++  aurora::gx::fifo::write_values(static_cast<u8>(s), static_cast<u8>(t));
+ }
+ 
+ void GXTexCoord1f32(f32 s) { GX_WRITE_F32(s); }
+@@ -252,15 +219,10 @@ void GXParam1s16(const s16 x) { aurora::gx::fifo::write_u16(static_cast<uint16_t
+ void GXParam1s32(const s32 x) { aurora::gx::fifo::write_u32(static_cast<uint32_t>(x)); }
+ void GXParam1f32(const f32 x) { aurora::gx::fifo::write_f32(x); }
+ void GXParam3f32(const f32 x, const f32 y, const f32 z) {
+-  aurora::gx::fifo::write_f32(x);
+-  aurora::gx::fifo::write_f32(y);
+-  aurora::gx::fifo::write_f32(z);
++  aurora::gx::fifo::write_values(x, y, z);
+ }
+ void GXParam4f32(const f32 x, const f32 y, const f32 z, const f32 w) {
+-  aurora::gx::fifo::write_f32(x);
+-  aurora::gx::fifo::write_f32(y);
+-  aurora::gx::fifo::write_f32(z);
+-  aurora::gx::fifo::write_f32(w);
++  aurora::gx::fifo::write_values(x, y, z, w);
+ }
+ 
+ } // extern "C"
+diff --git a/lib/dolphin/pad/pad.cpp b/lib/dolphin/pad/pad.cpp
+index 4e135d26d10..7b4bac00346 100644
+--- a/lib/dolphin/pad/pad.cpp
++++ b/lib/dolphin/pad/pad.cpp
+@@ -82,10 +82,19 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsPS3{{
+ }};
+ 
+ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsPS4{{
++#if defined(__ORBIS__)
++    // The PS4 build uses Nintendo's positions: Circle confirms (A), Cross goes back (B), Triangle
++    // is X and Square is Y (as Twilight HD's PlayStation layout labels them).
++    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_A},
++    {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_B},
++    {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_X},
++    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_Y},
++#else
+     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
+     {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_B},
+     {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_X},
+     {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_Y},
++#endif
+     {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
+     {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_TRIGGER_Z},
+     {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_L},
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 4dc6337cff2..c185e4438b6 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -25,6 +25,7 @@
+ #include <variant>
+ #include <thread>
+ 
++#include <SDL3/SDL_filesystem.h>
+ #include <SDL3/SDL_iostream.h>
+ #include <absl/container/flat_hash_map.h>
+ #include <absl/container/flat_hash_set.h>
+@@ -612,12 +613,57 @@ static sqlite3* open_pipeline_cache_seed_db(const std::string& path) {
+   return seedDb;
+ }
+ 
++// The bundled cache's identity (size and modification time) once it has been merged: merging it
++// again changes nothing, and it takes seconds on slow hardware.
++static std::string seed_identity(const std::string& seedPath) {
++  SDL_PathInfo info{};
++  if (!SDL_GetPathInfo(seedPath.c_str(), &info) || info.type != SDL_PATHTYPE_FILE) {
++    return {};
++  }
++  return fmt::format("{}:{}", info.size, info.modify_time);
++}
++
++static bool seed_already_merged(const std::string& identity) {
++  if (identity.empty() ||
++      sqlite::exec(g_pipelineCacheDb, "CREATE TABLE IF NOT EXISTS aurora_seed (identity TEXT PRIMARY KEY)") !=
++          SQLITE_OK) {
++    return false;
++  }
++  bool merged = false;
++  sqlite3_stmt* stmt = nullptr;
++  if (sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT 1 FROM aurora_seed WHERE identity = ?", -1, &stmt, nullptr) ==
++      SQLITE_OK) {
++    sqlite3_bind_text(stmt, 1, identity.c_str(), static_cast<int>(identity.size()), SQLITE_TRANSIENT);
++    merged = sqlite3_step(stmt) == SQLITE_ROW;
++  }
++  sqlite3_finalize(stmt);
++  return merged;
++}
++
++static void remember_seed_merged(const std::string& identity) {
++  if (identity.empty() || sqlite::exec(g_pipelineCacheDb, "DELETE FROM aurora_seed") != SQLITE_OK) {
++    return;
++  }
++  sqlite3_stmt* stmt = nullptr;
++  if (sqlite3_prepare_v2(g_pipelineCacheDb, "INSERT INTO aurora_seed (identity) VALUES (?)", -1, &stmt, nullptr) ==
++      SQLITE_OK) {
++    sqlite3_bind_text(stmt, 1, identity.c_str(), static_cast<int>(identity.size()), SQLITE_TRANSIENT);
++    sqlite3_step(stmt);
++  }
++  sqlite3_finalize(stmt);
++}
++
+ static void seed_pipeline_cache() {
+   if (g_pipelineCacheBroken || g_pipelineCacheDb == nullptr || g_pipelineCacheUpsertStmt == nullptr) {
+     return;
+   }
+ 
+   const auto seedPath = pipeline_cache_seed_path();
++  const auto identity = seed_identity(seedPath);
++  if (seed_already_merged(identity)) {
++    Log.info("Bundled pipeline cache '{}' is already merged", seedPath);
++    return;
++  }
+   sqlite3* seedDb = open_pipeline_cache_seed_db(seedPath);
+   if (seedDb == nullptr) {
+     return;
+@@ -707,6 +753,7 @@ static void seed_pipeline_cache() {
+   }
+ 
+   if (!readFailed) {
++    remember_seed_merged(identity);
+     Log.info("Seeded pipeline cache from '{}' ({} rows merged, {} rows skipped)", seedPath, mergedRows, skippedRows);
+   }
+ }
+@@ -720,16 +767,28 @@ static bool prepare_pipeline_cache_db() {
+   }
+ 
+   const auto path = io::fs_path_to_string(io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.db");
++#if defined(__ORBIS__)
++  // The PS4 has neither file locks nor shared memory for SQLite's WAL index: one process opens the
++  // cache, so no locking VFS, and exclusive locking mode keeps the WAL index in heap memory.
++  auto ret = sqlite3_open_v2(path.c_str(), &g_pipelineCacheDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix-none");
++#else
+   auto ret = sqlite3_open(path.c_str(), &g_pipelineCacheDb);
++#endif
+   if (ret != SQLITE_OK) {
+     Log.error("Failed to open pipeline cache database: {}", sqlite3_errmsg(g_pipelineCacheDb));
+     pipeline_cache_abort();
+     return false;
+   }
+ 
++#if defined(__ORBIS__)
++  ret = sqlite::exec(g_pipelineCacheDb,
++                     "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
++#else
+   ret = sqlite::exec(g_pipelineCacheDb, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
++#endif
+   if (ret != SQLITE_OK) {
+-    Log.error("Failed to set pipeline cache pragmas: {}", sqlite3_errmsg(g_pipelineCacheDb));
++    Log.error("Failed to set pipeline cache pragmas: {} (system errno {})", sqlite3_errmsg(g_pipelineCacheDb),
++              sqlite3_system_errno(g_pipelineCacheDb));
+     pipeline_cache_abort();
+     return false;
+   }
+@@ -962,6 +1021,9 @@ static void pipeline_worker() {
+ 
+   bool hasMore = false;
+   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
++#ifdef PS4ProfThreadBusy
++    PS4ProfThreadBusy("pipeline compile");
++#endif
+     PendingPipeline pending;
+     {
+       std::unique_lock lock{g_pipelineMutex};
+@@ -981,7 +1043,10 @@ static void pipeline_worker() {
+       pending = std::move(source.front());
+       source.pop_front();
+     }
+-    auto result = pending.create();
++    auto result = [&] {
++      ZoneScopedN("gfx: compile pipeline (worker)");
++      return pending.create();
++    }();
+     const auto pipelineCount = result.pipeline_count();
+     {
+       std::lock_guard lock{g_pipelineMutex};
+@@ -1093,6 +1158,17 @@ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTarge
+ }
+ 
+ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
++  // Nearly every draw finds its pipeline built and remembered already: then one hash of the config
++  // and one lock, instead of hashing it twice and copying it (and the layout) into a creation
++  // callback. Remembering again could not lower a known config's first frame.
++  const auto configKey = xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
++  const auto runtimeKey = xxh3_hash(layout.key, configKey);
++  {
++    std::lock_guard lock{g_pipelineMutex};
++    if (g_pipelines.contains(runtimeKey) && g_knownPipelines.contains(configKey)) {
++      return runtimeKey;
++    }
++  }
+   remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+   return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
+ }
+diff --git a/lib/gfx/render_worker.cpp b/lib/gfx/render_worker.cpp
+index 85783b60ec1..500e8db82d5 100644
+--- a/lib/gfx/render_worker.cpp
++++ b/lib/gfx/render_worker.cpp
+@@ -35,6 +35,9 @@ void worker_main(std::stop_token token) {
+   g_workerThreadId = std::this_thread::get_id();
+ 
+   while (true) {
++#ifdef PS4ProfThreadBusy
++    PS4ProfThreadBusy("aurora render");
++#endif
+     bool closed = false;
+     auto item = g_queue.pop_for(IdlePumpInterval, closed);
+     if (!item) {
+diff --git a/lib/gfx/texture_replacement.cpp b/lib/gfx/texture_replacement.cpp
+index 03dda4678ec..9b74f182535 100644
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -17,6 +17,10 @@
+ #include <absl/container/flat_hash_map.h>
+ #include <absl/container/flat_hash_set.h>
+ #include <absl/hash/hash.h>
++#if defined(__ORBIS__)
++#include "render_worker.hpp"
++#include <dawn/native/DawnNative.h>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -42,7 +46,15 @@ namespace aurora::texture {
+ namespace {
+ constexpr Module Log{"aurora::texture"};
+ 
++#if defined(__ORBIS__)
++// The PS4's GPU memory is the console's memory (the winsys gives RADV 2 GiB for its VRAM heap): the
++// cache holds 1 GiB at most, and a replacement nothing has drawn for a minute is let go
++// (sweep_idle_cache), so leaving an area frees its textures instead of keeping all until 4 GiB.
++constexpr uint64_t kReplacementCacheBudgetBytes = 1ull << 30;
++constexpr auto kReplacementIdleTime = std::chrono::seconds(60);
++#else
+ constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
++#endif
+ constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
+ constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
+ 
+@@ -89,6 +101,9 @@ struct SelectedCache {
+   uint64_t bytes = 0;
+   std::list<ReplacementKey>::iterator lruIt;
+   Tier tier = Tier::Full;
++  // Since when only the cache holds the handle: no texture object (drawn within the last 600
++  // frames) uses it, nor was it looked up. sweep_idle_cache lets it go after kReplacementIdleTime.
++  std::chrono::steady_clock::time_point unusedSince = std::chrono::steady_clock::now();
+ };
+ 
+ struct EntryLoadSnapshot {
+@@ -138,6 +153,12 @@ absl::flat_hash_set<uint64_t> s_failedIds;
+ absl::flat_hash_set<TextureSourceKey, SourceKeyHash> s_reportedMisses;
+ std::list<ReplacementKey> s_replacementLru;
+ uint64_t s_replacementCacheBytes = 0;
++#if defined(__ORBIS__)
++// Handles the cache let go of, released on the render thread (sweep_idle_cache): the last
++// reference destroys the Dawn texture, and Dawn (without implicit device synchronisation) must
++// not do that while the render thread records - v20 crashed with a reset command buffer.
++std::vector<gfx::TextureHandle> s_releaseOnRenderThread;
++#endif
+ uint64_t s_nextRegistrationId = 1;
+ uint64_t s_nextSequence = 1;
+ uint32_t s_sourceEntryCount = 0;
+@@ -767,9 +788,35 @@ std::optional<gfx::dds::MipTail> load_thumbnail(const EntryLoadSnapshot& entry)
+   return gfx::dds::parse_dds_mip_tail({bytes.data(), bytes.size()}, gx::texture::ReplacementThumbnailDim);
+ }
+ 
++#if defined(__ORBIS__)
++extern "C" uint64_t ps4_disc_busy_until_ns(void);
++
++// The PS4 build reads the game from the same hard drive: replacements wait while it reads (a
++// scene loading), at most 2 s per job. Steady clock nanoseconds, as ps4/disc/raw_disc.cpp.
++void wait_for_disc_idle() {
++  const auto now_ns = [] {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++  };
++  const uint64_t until = ps4_disc_busy_until_ns();
++  if (now_ns() >= until) {
++    return;
++  }
++  ZoneScopedN("tex: wait for the game's disc reads");
++  const uint64_t giveUp = now_ns() + 2'000'000'000ull;
++  for (uint64_t now = now_ns(); now < ps4_disc_busy_until_ns() && now < giveUp; now = now_ns()) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++  }
++}
++#endif
++
+ void worker_main(std::stop_token token) {
+   std::stop_callback notifyOnStop{token, [] { s_jobCv.notify_all(); }};
+   while (true) {
++#ifdef PS4ProfThreadBusy
++    PS4ProfThreadBusy("texture load");
++#endif
+     LoadJob job;
+     {
+       std::unique_lock lock{s_jobMutex};
+@@ -789,6 +836,9 @@ void worker_main(std::stop_token token) {
+       }
+     }
+ 
++#if defined(__ORBIS__)
++    wait_for_disc_idle();
++#endif
+     std::optional<gfx::ConvertedTexture> texture;
+     bool thumbnailIncludesBase = false;
+     bool thumbnailStored = false;
+@@ -798,6 +848,7 @@ void worker_main(std::stop_token token) {
+         thumbnailIncludesBase = thumbnail->includesBase;
+       }
+     } else if (job.entry.kind == EntryKind::File) {
++      ZoneScopedN("tex: load replacement file");
+       texture = load_file_replacement(job.entry);
+     } else if (job.entry.kind == EntryKind::Virtual) {
+       texture = load_virtual_replacement(job.entry);
+@@ -840,8 +891,14 @@ void start_worker_pool() {
+     return;
+   }
+   const uint32_t hardwareThreads = std::max(std::thread::hardware_concurrency(), 1u);
++#if defined(__ORBIS__)
++  // Loading replacements is reading files; more readers make the PS4's hard drive seek between them.
++  constexpr uint32_t MaxWorkers = 2;
++#else
++  constexpr uint32_t MaxWorkers = 4;
++#endif
+   const uint32_t workerCount =
+-      s_workerCountOverride != 0 ? s_workerCountOverride : std::clamp(hardwareThreads / 2, 1u, 4u);
++      s_workerCountOverride != 0 ? s_workerCountOverride : std::clamp(hardwareThreads / 2, 1u, MaxWorkers);
+   for (uint32_t i = 0; i < workerCount; ++i) {
+     s_workers.emplace_back(
+         thread::Options{
+@@ -1023,10 +1080,14 @@ void erase_cache_locked(const ReplacementKey& key) noexcept {
+   }
+   s_replacementCacheBytes -= std::min(s_replacementCacheBytes, it->second.bytes);
+   s_replacementLru.erase(it->second.lruIt);
++#if defined(__ORBIS__)
++  s_releaseOnRenderThread.push_back(std::move(it->second.handle));
++#endif
+   s_cacheByKey.erase(it);
+ }
+ 
+ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
++  it->second.unusedSince = std::chrono::steady_clock::now();
+   if (it->second.lruIt != s_replacementLru.begin()) {
+     s_replacementLru.splice(s_replacementLru.begin(), s_replacementLru, it->second.lruIt);
+     it->second.lruIt = s_replacementLru.begin();
+@@ -1065,6 +1126,69 @@ void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::Textu
+   evict_replacement_cache_if_needed();
+ }
+ 
++#if defined(__ORBIS__)
++// Frees the GPU memory of replacements no texture object has used for kReplacementIdleTime.
++// Called once a frame; looks once a second.
++void sweep_idle_cache_impl() noexcept {
++  static uint32_t s_calls = 0;
++  static uint64_t s_freedSinceTrim = 0;
++  static auto s_lastTrim = std::chrono::steady_clock::now();
++  if (++s_calls % 60 != 0) {
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  uint64_t freed = 0;
++  size_t count = 0;
++  {
++    std::lock_guard lock{s_registryMutex};
++    for (auto it = s_cacheByKey.begin(); it != s_cacheByKey.end();) {
++      auto& cache = it->second;
++      if (cache.handle.use_count() > 1) {
++        cache.unusedSince = now;  // a texture object holds it: in use
++        ++it;
++        continue;
++      }
++      if (now - cache.unusedSince < kReplacementIdleTime) {
++        ++it;
++        continue;
++      }
++      freed += cache.bytes;
++      ++count;
++      s_replacementCacheBytes -= std::min(s_replacementCacheBytes, cache.bytes);
++      s_replacementLru.erase(cache.lruIt);
++      s_releaseOnRenderThread.push_back(std::move(cache.handle));
++      s_cacheByKey.erase(it++);
++    }
++  }
++  if (count != 0) {
++    Log.info("Released {} idle texture replacements ({:.1f} MiB), {:.1f} MiB cached", count,
++             static_cast<double>(freed) / 1048576.0, static_cast<double>(s_replacementCacheBytes) / 1048576.0);
++  }
++  // Dawn keeps freed memory blocks for reuse: hand them back once enough has been freed. On the
++  // render thread, after the textures (it submits Dawn's pending commands).
++  s_freedSinceTrim += freed;
++  if (s_freedSinceTrim >= (32ull << 20) && now - s_lastTrim >= std::chrono::seconds(30)) {
++    gfx::render_worker::enqueue_work([] { dawn::native::ReduceMemoryUsage(webgpu::g_device.Get()); });
++    s_freedSinceTrim = 0;
++    s_lastTrim = now;
++  }
++}
++
++// Hands the handles the cache let go of to the render thread. Once a frame.
++void release_on_render_thread() noexcept {
++  std::shared_ptr<std::vector<gfx::TextureHandle>> batch;
++  {
++    std::lock_guard lock{s_registryMutex};
++    if (s_releaseOnRenderThread.empty()) {
++      return;
++    }
++    batch = std::make_shared<std::vector<gfx::TextureHandle>>(std::move(s_releaseOnRenderThread));
++    s_releaseOnRenderThread.clear();
++  }
++  gfx::render_worker::enqueue_work([batch] { batch->clear(); });
++}
++#endif
++
+ const ReplacementEntry* select_entry(const std::vector<ReplacementEntry>& entries) noexcept {
+   const ReplacementEntry* selected = nullptr;
+   for (const auto& entry : entries) {
+@@ -1701,9 +1825,20 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
+ namespace aurora::gfx::texture_replacement {
+ using namespace aurora::texture;
+ 
++void sweep_idle_cache() noexcept {
++#if defined(__ORBIS__)
++  ::aurora::texture::release_on_render_thread();  // the previous frame's, before the sweep adds more
++  ::aurora::texture::sweep_idle_cache_impl();
++  ::aurora::texture::release_on_render_thread();
++#endif
++}
++
+ void shutdown() noexcept {
+   clear_replacements();
+   stop_worker_pool();
++#if defined(__ORBIS__)
++  ::aurora::texture::release_on_render_thread();
++#endif
+ }
+ 
+ StreamingStats process_streaming() noexcept {
+diff --git a/lib/gfx/texture_replacement.hpp b/lib/gfx/texture_replacement.hpp
+index e99514db1ce..2c5c68a7e47 100644
+--- a/lib/gfx/texture_replacement.hpp
++++ b/lib/gfx/texture_replacement.hpp
+@@ -17,6 +17,8 @@ struct StreamingStats {
+ };
+ 
+ void shutdown() noexcept;
++// Once a frame: on the PS4, lets go of replacements nothing has drawn for a minute.
++void sweep_idle_cache() noexcept;
+ StreamingStats process_streaming() noexcept;
+ std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) noexcept;
+ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index bcaba60c56e..b7be2bd5426 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -76,6 +76,9 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+ void worker_main(std::stop_token token) noexcept {
+   std::stop_callback wakeOnStop{token, wake_worker};
+   while (true) {
++#ifdef PS4ProfThreadBusy
++    PS4ProfThreadBusy("gx fifo");
++#endif
+     const uint32_t event = sWorkerWake.load(std::memory_order_acquire);
+     const uint64_t processed = sProcessed.load(std::memory_order_relaxed);
+     const uint64_t published = sPublished.load(std::memory_order_acquire);
+diff --git a/lib/gx/fifo.hpp b/lib/gx/fifo.hpp
+index 0d6a5d8ab36..6f405ce5bc7 100644
+--- a/lib/gx/fifo.hpp
++++ b/lib/gx/fifo.hpp
+@@ -67,6 +67,26 @@ inline void write_u8(const uint8_t val) {
+   }
+ }
+ 
++// Several values in one write, big-endian as the separate writes would store them: one capacity
++// check and one copy instead of one per value (vertex attributes are written per vertex).
++template <typename... T>
++ALWAYS_INLINE void write_values(const T... values) {
++  uint8_t bytes[(sizeof(T) + ...)];
++  size_t offset = 0;
++  (
++      [&] {
++        if constexpr (sizeof(T) == 1) {
++          bytes[offset] = static_cast<uint8_t>(values);
++        } else {
++          const auto swapped = bswap(values);
++          std::memcpy(bytes + offset, &swapped, sizeof(swapped));
++        }
++        offset += sizeof(T);
++      }(),
++      ...);
++  write_data(bytes, sizeof(bytes));
++}
++
+ inline void write_u16(const uint16_t val) {
+   const auto out = bswap(val);
+   write_data(&out, sizeof(out));
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index a56709a9f62..69dc7bdd680 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -722,6 +722,7 @@ void end_frame() noexcept {
+   ++s_frameCount;
+   apply_pending_invalidations();
+   sweep_object_caches();
++  gfx::texture_replacement::sweep_idle_cache();
+ }
+ 
+ void shutdown() noexcept {
+diff --git a/lib/gx/texture.hpp b/lib/gx/texture.hpp
+index 29c9a48bfa2..e24c07a05f5 100644
+--- a/lib/gx/texture.hpp
++++ b/lib/gx/texture.hpp
+@@ -27,7 +27,14 @@ namespace texture {
+ constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
+ constexpr uint64_t ObjectCacheIdleFrames = 600;
+ constexpr bool AsyncTextureReplacements = true;
++#if defined(__ORBIS__)
++// Thumbnails are read from every replacement when the pack is registered: on the PS4's hard drive
++// that is thousands of seeks while the game loads from the same drive. Without a thumbnail the
++// original texture shows until the replacement has loaded.
++constexpr uint32_t ReplacementThumbnailDim = 0;
++#else
+ constexpr uint32_t ReplacementThumbnailDim = 64;
++#endif
+ constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
+ 
+ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noexcept;
+diff --git a/lib/input.cpp b/lib/input.cpp
+index ce18e9ec193..c6207954241 100644
+--- a/lib/input.cpp
++++ b/lib/input.cpp
+@@ -16,7 +16,7 @@
+ 
+ using namespace std::string_view_literals;
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ extern "C" void ps5_input_initialize();
+ extern "C" void ps5_input_shutdown();
+ #endif
+@@ -454,7 +454,7 @@ void persist_controller_for_player(uint32_t player, const GameController* contro
+ }
+ 
+ void initialize() noexcept {
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+   ps5_input_initialize();
+ #endif
+   /* Make sure we initialize everything input related now, this will automatically add all of the connected controllers
+@@ -481,7 +481,7 @@ void get_mouse_scroll(float* scrollX, float* scrollY) noexcept {
+ }
+ 
+ void shutdown() noexcept {
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+   ps5_input_shutdown();
+ #endif
+   // Upon shutdown we want to ensure all controllers are in a default state, so force all rumble supporting controllers
+diff --git a/lib/thread.cpp b/lib/thread.cpp
+index 348b0ec45f7..7bcded0a2a6 100644
+--- a/lib/thread.cpp
++++ b/lib/thread.cpp
+@@ -229,6 +229,31 @@ bool apply_cache_domain(const CacheDomain& domain) noexcept {
+   }
+   return SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr) != 0;
+ }
++#elif defined(__ORBIS__)
++extern "C" {
++void* scePthreadSelf(void);
++int scePthreadSetaffinity(void* thread, uint64_t mask);
++}
++
++// The PS4's Jaguar CPU: two clusters of four cores, each with its own 2 MiB L2; applications run
++// on cores 0-5 (and 6 in part). The main, FIFO and render threads hand each frame's data along, so
++// they share the first cluster instead of wandering between both.
++std::optional<CacheDomain> find_cache_domain() {
++  CacheDomain domain;
++  domain.cacheLevel = 2;
++  for (uint32_t number = 0; number < 4; ++number) {
++    domain.processors.push_back({.number = number});
++  }
++  return domain;
++}
++
++bool apply_cache_domain(const CacheDomain& domain) noexcept {
++  uint64_t mask = 0;
++  for (const auto& processor : domain.processors) {
++    mask |= uint64_t{1} << processor.number;
++  }
++  return scePthreadSetaffinity(scePthreadSelf(), mask) == 0;
++}
+ #else
+ std::optional<CacheDomain> find_cache_domain() { return std::nullopt; }
+ bool apply_cache_domain(const CacheDomain&) noexcept { return false; }
+diff --git a/lib/webgpu/gpu_cache.cpp b/lib/webgpu/gpu_cache.cpp
+index 241ea0ccb93..832c41dbbcb 100644
+--- a/lib/webgpu/gpu_cache.cpp
++++ b/lib/webgpu/gpu_cache.cpp
+@@ -104,16 +104,26 @@ static bool cache_init_core() {
+ 
+   std::string file = io::fs_path_to_string(cache_path());
+   Log.debug("Using dawn cache at {}", file);
++#if defined(__ORBIS__)
++  // The PS4 has neither file locks nor shared memory for SQLite's WAL index: one process opens the
++  // cache, so no locking VFS, and exclusive locking mode keeps the WAL index in heap memory.
++  auto ret = sqlite3_open_v2(file.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix-none");
++#else
+   auto ret = sqlite3_open(file.c_str(), &db);
++#endif
+   if (ret != SQLITE_OK) {
+     Log.error("Failed to open database: {} (system errno {})", sqlite3_errmsg(db), sqlite3_system_errno(db));
+     return false;
+   }
+ 
+   // WAL mode + NORMAL = no need for disk syncs, consistent but not durable is fine.
++#if defined(__ORBIS__)
++  ret = sqlite::exec(db, "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
++#else
+   ret = sqlite::exec(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
++#endif
+   if (ret != SQLITE_OK) {
+-    Log.error("Failed to set pragmas: {}", sqlite3_errmsg(db));
++    Log.error("Failed to set pragmas: {} (system errno {})", sqlite3_errmsg(db), sqlite3_system_errno(db));
+     return false;
+   }
+ 

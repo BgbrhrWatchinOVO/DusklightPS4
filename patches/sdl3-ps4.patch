@@ -1,0 +1,97 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 95b3558adfe..24d838fc35f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1329,8 +1329,9 @@ if(SDL_HAPTIC)
+ endif()
+ 
+ 
+-# Native PS5 output. The title's native link recipe supplies SceAudioOut.
+-if(SDL_AUDIO AND PS5)
++# Native PS5 output, and PS4 output through the same SceAudioOut calls. The title's native link
++# recipe supplies SceAudioOut.
++if(SDL_AUDIO AND (PS5 OR PS4))
+   set(SDL_AUDIO_DRIVER_PS5 1)
+   set(HAVE_SDL_AUDIO TRUE)
+   sdl_glob_sources("${SDL3_SOURCE_DIR}/src/audio/ps5/*.c")
+@@ -1398,7 +1399,7 @@ if(UNIX OR APPLE OR HAIKU OR RISCOS)
+ endif()
+ 
+ if(SDL_JOYSTICK)
+-  if(SDL_VIRTUAL_JOYSTICK OR PS5)
++  if(SDL_VIRTUAL_JOYSTICK OR PS5 OR PS4)
+     set(HAVE_VIRTUAL_JOYSTICK TRUE)
+     set(SDL_JOYSTICK_VIRTUAL 1)
+     sdl_glob_sources(
+@@ -2074,7 +2075,7 @@ elseif(UNIX AND NOT APPLE AND NOT RISCOS AND NOT HAIKU)
+   endif()
+ 
+   if(SDL_JOYSTICK)
+-    if((FREEBSD OR NETBSD OR OPENBSD OR BSDI) AND NOT PS5)
++    if((FREEBSD OR NETBSD OR OPENBSD OR BSDI) AND NOT PS5 AND NOT PS4)
+       CheckUSBHID()
+     endif()
+     if((LINUX OR FREEBSD) AND HAVE_LINUX_INPUT_H AND NOT ANDROID)
+@@ -3455,7 +3456,7 @@ if(WINDOWS)
+   )
+   set(SDL_PROCESS_WINDOWS 1)
+   set(HAVE_SDL_PROCESS TRUE)
+-elseif(NOT ANDROID AND NOT PS5)
++elseif(NOT ANDROID AND NOT PS5 AND NOT PS4)
+   check_c_source_compiles("
+ #include <spawn.h>
+ #include <unistd.h>
+diff --git a/cmake/sdlchecks.cmake b/cmake/sdlchecks.cmake
+index bb8a97d65b4..7c186b555d5 100644
+--- a/cmake/sdlchecks.cmake
++++ b/cmake/sdlchecks.cmake
+@@ -973,6 +973,10 @@ macro(CheckPTHREAD)
+       # causes Carbon.p complaints?
+       # set(PTHREAD_CFLAGS "-D_REENTRANT -D_THREAD_SAFE")
+       set(PTHREAD_LDFLAGS "")
++    elseif(PS4)
++      # PS4 titles link with ld.lld itself, which takes no -pthread.
++      set(PTHREAD_CFLAGS "-D_REENTRANT -D_THREAD_SAFE")
++      set(PTHREAD_LDFLAGS "-lpthread")
+     elseif(FREEBSD)
+       set(PTHREAD_CFLAGS "-D_REENTRANT -D_THREAD_SAFE")
+       set(PTHREAD_LDFLAGS "-pthread")
+diff --git a/src/SDL.c b/src/SDL.c
+index 3224a2ce4e9..2f378aacea3 100644
+--- a/src/SDL.c
++++ b/src/SDL.c
+@@ -717,7 +717,7 @@ void SDL_Quit(void)
+     SDL_DBus_Quit();
+ #endif
+ 
+-#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_EMSCRIPTEN) && !defined(SDL_PLATFORM_PRIVATE) && !defined(__PROSPERO__)
++#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_EMSCRIPTEN) && !defined(SDL_PLATFORM_PRIVATE) && !defined(__PROSPERO__) && !defined(__ORBIS__)
+     SDL_Gtk_Quit();
+ #endif
+ 
+diff --git a/src/core/unix/SDL_gtk.c b/src/core/unix/SDL_gtk.c
+index 95133c0727c..6d6d04e6097 100644
+--- a/src/core/unix/SDL_gtk.c
++++ b/src/core/unix/SDL_gtk.c
+@@ -19,7 +19,7 @@
+   3. This notice may not be removed or altered from any source distribution.
+ */
+ #include "SDL_internal.h"
+-#if !defined(__PROSPERO__)
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)
+ #include "SDL_gtk.h"
+ 
+ #include <dlfcn.h>
+diff --git a/src/filesystem/unix/SDL_sysfilesystem.c b/src/filesystem/unix/SDL_sysfilesystem.c
+index 3cc8159de48..a6983907956 100644
+--- a/src/filesystem/unix/SDL_sysfilesystem.c
++++ b/src/filesystem/unix/SDL_sysfilesystem.c
+@@ -124,7 +124,7 @@ static char *search_path_for_binary(const char *bin)
+ 
+ static char *GetExePath(void)
+ {
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     return SDL_strdup("/app0/eboot.bin");
+ #endif
+     char *result = NULL;

@@ -1,0 +1,3911 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7936263a196..b0bfdcaf3a5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,8 @@ project(dusklight LANGUAGES C CXX VERSION ${BOREALIS_APP_VERSION})
+ 
+ if (PS5)
+     include(ps5/Platform.cmake)
++elseif (PS4)
++    include(ps4/Platform.cmake)
+ endif ()
+ 
+ if (APPLE)
+@@ -81,6 +83,8 @@ set(AURORA_ENABLE_RMLUI ON CACHE BOOL "Enable RmlUi UI support" FORCE)
+ add_subdirectory(extern/aurora EXCLUDE_FROM_ALL)
+ if (PS5)
+     target_sources(aurora_core PRIVATE ps5/input.cpp ps5/native/platform.c)
++elseif (PS4)
++    target_sources(aurora_core PRIVATE ps4/input.cpp ps4/native/platform.c)
+ endif ()
+ target_compile_definitions(aurora_mtx PRIVATE MTX_USE_PS=1)
+ 
+@@ -251,6 +255,9 @@ if (DUSK_HAS_FUNCHOOK)
+     list(APPEND _fetch_content_deps funchook)
+ endif ()
+ FetchContent_MakeAvailable(${_fetch_content_deps})
++if (DUSK_HAS_FUNCHOOK AND PS4)
++    ps4_adapt_funchook()
++endif ()
+ 
+ if (DUSK_HAS_FUNCHOOK AND APPLE)
+     target_sources(funchook-static PRIVATE src/dusk/mods/loader/code_patch_macos.cpp)
+@@ -399,13 +406,42 @@ if (DUSK_ENABLE_CODE_MODS)
+         setup_windows_exports(dusklight)
+     endif ()
+     # Post-link symbol manifest: hookable-surface name->address map keyed to the build.
+-    setup_symbol_manifest(dusklight)
++    if (PS4)
++        ps4_setup_symbol_manifest(dusklight)  # ps4/Platform.cmake: written into reserved space
++    else ()
++        setup_symbol_manifest(dusklight)
++    endif ()
+ endif ()
+ 
+ # Hook reliability: prevent auto-inlining, guarantee patchable function entries,
+ # and disable identical-code folding for game functions.
+ if (DUSK_ENABLE_CODE_MODS)
++    # The libraries mods may hook besides the game. The PS4 build links its mods in
++    # (ps4/Platform.cmake), so there only the libraries those hook keep hook-safe code, and the rest
++    # (aurora's GX command processing, J3D, ...) is optimised fully.
++    if (PS4)
++        set(DUSK_HOOKABLE_LIBRARIES ${PS4_HOOKED_LIBRARIES})
++    else ()
++        set(DUSK_HOOKABLE_LIBRARIES ${JSYSTEM_LIBRARIES} aurora_card aurora_core aurora_dvd aurora_gd aurora_gx
++                aurora_mtx aurora_os aurora_pad aurora_si aurora_vi)
++    endif ()
+     set(DUSK_GAME_ABI_INLINE_OPTIONS)
++    if (PS4)
++        # The decompiled libraries rely on behaviour C++ leaves undefined (uninitialised locals,
++        # type punning through pointers, signed overflow, null checks after dereferences). With
++        # hook-safe code the optimiser rarely saw across functions; fully inlined and PGO-optimised
++        # it deleted code (JASChannel::updateDSPChannel). These make that behaviour defined.
++        set(_ps4_ub_guards -ftrivial-auto-var-init=zero -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks)
++        foreach (_lib IN LISTS JSYSTEM_LIBRARIES ITEMS aurora_card aurora_core aurora_dvd aurora_gd aurora_gx
++                 aurora_mtx aurora_os aurora_pad aurora_si aurora_vi)
++            if (TARGET ${_lib})
++                get_target_property(_lib_imported ${_lib} IMPORTED)
++                if (NOT _lib_imported)
++                    target_compile_options(${_lib} PRIVATE ${_ps4_ub_guards})
++                endif ()
++            endif ()
++        endforeach ()
++    endif ()
+     if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+         if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+             list(APPEND DUSK_GAME_ABI_INLINE_OPTIONS
+@@ -427,11 +463,7 @@ if (DUSK_ENABLE_CODE_MODS)
+     if (DUSK_GAME_ABI_INLINE_OPTIONS)
+         target_compile_options(dusklight PRIVATE ${DUSK_GAME_ABI_INLINE_OPTIONS})
+ 
+-        foreach(jsystem_lib IN LISTS JSYSTEM_LIBRARIES)
+-            target_compile_options(${jsystem_lib} PRIVATE ${DUSK_GAME_ABI_INLINE_OPTIONS})
+-        endforeach()
+-        foreach(_sdk_lib aurora_card aurora_core aurora_dvd aurora_gd aurora_gx aurora_mtx
+-                aurora_os aurora_pad aurora_si aurora_vi)
++        foreach(_sdk_lib IN LISTS DUSK_HOOKABLE_LIBRARIES)
+             if (TARGET ${_sdk_lib})
+                 get_target_property(_sdk_lib_imported ${_sdk_lib} IMPORTED)
+                 if (NOT _sdk_lib_imported)
+@@ -461,11 +493,7 @@ if (DUSK_ENABLE_CODE_MODS)
+ 
+     if (DEFINED DUSK_PATCHABLE_ENTRY_FLAG)
+         target_compile_options(dusklight PRIVATE ${DUSK_PATCHABLE_ENTRY_FLAG})
+-        foreach(jsystem_lib IN LISTS JSYSTEM_LIBRARIES)
+-            target_compile_options(${jsystem_lib} PRIVATE ${DUSK_PATCHABLE_ENTRY_FLAG})
+-        endforeach()
+-        foreach(_sdk_lib aurora_card aurora_core aurora_dvd aurora_gd aurora_gx aurora_mtx
+-                aurora_os aurora_pad aurora_si aurora_vi)
++        foreach(_sdk_lib IN LISTS DUSK_HOOKABLE_LIBRARIES)
+             if (TARGET ${_sdk_lib})
+                 get_target_property(_sdk_lib_imported ${_sdk_lib} IMPORTED)
+                 if (NOT _sdk_lib_imported)
+@@ -544,7 +572,8 @@ endif ()
+ 
+ include(cmake/ModSDK.cmake)
+ 
+-if (DUSK_ENABLE_CODE_MODS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
++# The PS4 build cannot load mod libraries; ps4/Platform.cmake links its mods into the game.
++if (DUSK_ENABLE_CODE_MODS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT PS4)
+     add_custom_target(dusklight_mods) # Aggregate target for all in-tree mods
+     add_subdirectory(mods/luau_runtime)
+     add_subdirectory(mods/template_mod)
+@@ -732,7 +761,11 @@ endforeach ()
+ 
+ install_bundled_mods()
+ 
+-if (PS5 AND TARGET libzstd_static)
++if ((PS5 OR PS4) AND TARGET libzstd_static)
+     # Native SELF imports cannot represent absent optional weak trace hooks.
+     target_compile_definitions(libzstd_static PRIVATE ZSTD_TRACE=0)
+ endif ()
++
++if (PS4)
++    ps4_finish_game(dusklight)
++endif ()
+diff --git a/libs/JSystem/include/JSystem/J3DGraphBase/J3DGD.h b/libs/JSystem/include/JSystem/J3DGraphBase/J3DGD.h
+index e61ca2fa30a..5edf0ff479b 100644
+--- a/libs/JSystem/include/JSystem/J3DGraphBase/J3DGD.h
++++ b/libs/JSystem/include/JSystem/J3DGraphBase/J3DGD.h
+@@ -9,15 +9,23 @@ inline void J3DGDWrite_u8(u8 data) {
+ }
+ 
+ inline void J3DGDWrite_u16(u16 data) {
++#if TARGET_PC
++    __GDWriteBE(data, 2);  // one pointer update (GDBase.h)
++#else
+     __GDWrite((u8)((data >> 8)));
+     __GDWrite((u8)((data >> 0) & 0xFF));
++#endif
+ }
+ 
+ inline void J3DGDWrite_u32(u32 data) {
++#if TARGET_PC
++    __GDWriteBE(data, 4);  // one pointer update (GDBase.h)
++#else
+     __GDWrite((u8)((data >> 24) & 0xFF));
+     __GDWrite((u8)((data >> 16) & 0xFF));
+     __GDWrite((u8)((data >> 8) & 0xFF));
+     __GDWrite((u8)((data >> 0) & 0xFF));
++#endif
+ }
+ 
+ inline void J3DGDWrite_f32(f32 data) {
+diff --git a/libs/JSystem/src/J2DGraph/J2DPane.cpp b/libs/JSystem/src/J2DGraph/J2DPane.cpp
+index 01ab0e5444c..757de6f7cbf 100644
+--- a/libs/JSystem/src/J2DGraph/J2DPane.cpp
++++ b/libs/JSystem/src/J2DGraph/J2DPane.cpp
+@@ -11,11 +11,40 @@
+ #include "helpers/math.h"
+ #endif
+ 
++#if TARGET_PC
++namespace {
++// J2DPane::search's memo (main thread only, as all of J2D): the result of an outermost search per
++// (pane, tag), valid while s_searchGeneration is unchanged. Creating, attaching or destroying a
++// pane, or setting its tag, starts a new generation.
++struct J2DSearchCacheEntry {
++    J2DPane* root;
++    u64 tag;
++    J2DPane* result;
++    u32 generation;
++};
++J2DSearchCacheEntry s_searchCache[512];
++u32 s_searchGeneration = 1;
++u32 s_searchDepth = 0;
++
++inline size_t j2d_search_slot(const J2DPane* pane, u64 tag) {
++    const u64 h = (reinterpret_cast<uintptr_t>(pane) >> 4) * 0x9E3779B97F4A7C15ull ^ tag * 0xC2B2AE3D27D4EB4Full;
++    return static_cast<size_t>(h >> 55);  // 9 bits: 512 slots
++}
++}  // namespace
++
++static inline void j2d_invalidate_search_cache() {
++    ++s_searchGeneration;
++}
++#else
++static inline void j2d_invalidate_search_cache() {}
++#endif
++
+ J2DPane::J2DPane() : mBounds(), mGlobalBounds(), mClipRect(), mPaneTree(this) {
+     mTransform = NULL;
+     mKind = 'PAN1';
+     mVisible = true;
+     mInfoTag = 0;
++    j2d_invalidate_search_cache();
+     mUserInfoTag = 0;
+     mBounds.set(0, 0, 0, 0);
+     initiate();
+@@ -54,10 +83,12 @@ void J2DPane::initialize(J2DPane* p_pane, bool visible, u64 infoTag,
+     mKind = 'PAN1';
+     mVisible = visible;
+     mInfoTag = infoTag;
++    j2d_invalidate_search_cache();
+     mUserInfoTag = 0;
+     mBounds.set(bounds);
+     if (p_pane != NULL) {
+         p_pane->mPaneTree.appendChild(&mPaneTree);
++        j2d_invalidate_search_cache();
+     }
+ 
+     initiate();
+@@ -75,6 +106,7 @@ void J2DPane::initialize(u64 tag, const JGeometry::TBox2<f32>& bounds) {
+     mKind = 'PAN1';
+     mVisible = true;
+     mInfoTag = tag;
++    j2d_invalidate_search_cache();
+     mUserInfoTag = 0;
+     mBounds.set(bounds);
+     initiate();
+@@ -112,6 +144,7 @@ void J2DPane::makePaneStream(J2DPane* p_pane, JSURandomInputStream* p_stream) {
+     p_stream->skip(2);
+ 
+     mInfoTag = p_stream->read32b();
++    j2d_invalidate_search_cache();
+ 
+     f32 x0 = p_stream->readS16();
+     f32 y0 = p_stream->readS16();
+@@ -152,6 +185,7 @@ void J2DPane::makePaneStream(J2DPane* p_pane, JSURandomInputStream* p_stream) {
+     p_stream->align(4);
+     if (p_pane != NULL) {
+         p_pane->mPaneTree.appendChild(&mPaneTree);
++        j2d_invalidate_search_cache();
+     }
+ 
+     mCullMode = GX_CULL_NONE;
+@@ -208,6 +242,7 @@ void J2DPane::changeUseTrans(J2DPane* p_pane) {
+ }
+ 
+ J2DPane::~J2DPane() {
++    j2d_invalidate_search_cache();
+     JSUTreeIterator<J2DPane> iterator = mPaneTree.getFirstChild();
+     for (; iterator != mPaneTree.getEndChild();) {
+         JKR_DELETE((iterator++).getObject());
+@@ -220,6 +255,7 @@ bool J2DPane::appendChild(J2DPane* p_child) {
+ 
+     const J2DPane* parent = p_child->getParentPane();
+     bool result = mPaneTree.appendChild(&p_child->mPaneTree);
++    j2d_invalidate_search_cache();
+ 
+     if (result && parent == NULL) {
+         p_child->add(mBounds.i.x, mBounds.i.y);
+@@ -237,6 +273,7 @@ bool J2DPane::insertChild(J2DPane* p_prev, J2DPane* p_child) {
+ 
+     bool result =
+         mPaneTree.insertChild(p_prev != NULL ? &p_prev->mPaneTree : NULL, &p_child->mPaneTree);
++        j2d_invalidate_search_cache();
+ 
+     if (result && parent == NULL) {
+         p_child->add(mBounds.i.x, mBounds.i.y);
+@@ -469,12 +506,33 @@ J2DPane* J2DPane::search(u64 tag) {
+         return this;
+     }
+ 
++#if TARGET_PC
++    // Mods search their screens for panes every frame (Twilight HD does so ~160 times in its draw
++    // hooks), each search walking the whole tree, misses included: the PS4 profile ranked it the
++    // hottest code of the game. Outermost searches are remembered until the tree changes.
++    J2DSearchCacheEntry* entry = NULL;
++    if (s_searchDepth == 0) {
++        entry = &s_searchCache[j2d_search_slot(this, tag)];
++        if (entry->root == this && entry->tag == tag && entry->generation == s_searchGeneration) {
++            return entry->result;
++        }
++    }
++    ++s_searchDepth;
++#endif
++    J2DPane* found = NULL;
+     for (JSUTreeIterator<J2DPane> iter = mPaneTree.getFirstChild(); iter != mPaneTree.getEndChild(); ++iter) {
+         if (J2DPane* result = iter.getObject()->search(tag)) {
+-            return result;
++            found = result;
++            break;
+         }
+     }
+-    return NULL;
++#if TARGET_PC
++    --s_searchDepth;
++    if (entry != NULL) {
++        *entry = {this, tag, found, s_searchGeneration};
++    }
++#endif
++    return found;
+ }
+ 
+ J2DPane* J2DPane::searchUserInfo(u64 tag) {
+@@ -658,6 +716,7 @@ void J2DPane::makePaneExStream(J2DPane* p_parent, JSURandomInputStream* p_stream
+     field_0x4 = data.field_0xa;
+     mVisible = !!data.mVisible;
+     mInfoTag = data.mInfoTag;
++    j2d_invalidate_search_cache();
+     mUserInfoTag = data.mUserInfoTag;
+     mScaleX = data.mScaleX;
+     mScaleY = data.mScaleY;
+@@ -693,6 +752,7 @@ void J2DPane::makePaneExStream(J2DPane* p_parent, JSURandomInputStream* p_stream
+ 
+     if (p_parent != NULL) {
+         p_parent->mPaneTree.appendChild(&mPaneTree);
++        j2d_invalidate_search_cache();
+     }
+ 
+     mCullMode = GX_CULL_NONE;
+diff --git a/libs/JSystem/src/JAudio2/JASChannel.cpp b/libs/JSystem/src/JAudio2/JASChannel.cpp
+index 5b4a3773211..145c1b48496 100644
+--- a/libs/JSystem/src/JAudio2/JASChannel.cpp
++++ b/libs/JSystem/src/JAudio2/JASChannel.cpp
+@@ -367,7 +367,10 @@ s32 JASChannel::updateDSPChannel(JASDsp::TChannel* i_channel) {
+         }
+     }
+ 
+-    u16 mixer_volume[6];
++    // Zeroed: in Dolby mode updateEffectorParam sets the auto mixer and leaves these untouched,
++    // and reading them uninitialised is undefined (with updateEffectorParam inlined, the optimiser
++    // deleted the rest of the update and the audio thread ran into the bank dispose loop).
++    u16 mixer_volume[6] = {};
+     updateEffectorParam(i_channel, mixer_volume, effect_params);
+     for (u8 i = 0; i < 6; i++) {
+         i_channel->setMixerVolume(i, mixer_volume[i]);
+diff --git a/libs/JSystem/src/JKernel/JKRDecomp.cpp b/libs/JSystem/src/JKernel/JKRDecomp.cpp
+index 2f8b9a68d76..00d2618324b 100644
+--- a/libs/JSystem/src/JKernel/JKRDecomp.cpp
++++ b/libs/JSystem/src/JKernel/JKRDecomp.cpp
+@@ -3,6 +3,7 @@
+ #include "JSystem/JKernel/JKRDecomp.h"
+ #include "JSystem/JKernel/JKRAramPiece.h"
+ #include "global.h"
++#include <tracy/Tracy.hpp>
+ 
+ #if PLATFORM_GCN
+ const u32 stack_size = 0x800;
+@@ -43,6 +44,9 @@ void* JKRDecomp::run() {
+     OSInitMessageQueue(&sMessageQueue, sMessageBuffer, 8);
+     for (;;) {
+         OSMessage message;
++#ifdef PS4ProfThreadBusy
++        PS4ProfThreadBusy("decompress");
++#endif
+         OSReceiveMessage(&sMessageQueue, &message, OS_MESSAGE_BLOCK);
+ 
+         JKRDecompCommand* command = (JKRDecompCommand*)message;
+@@ -134,6 +138,7 @@ void JKRDecomp::decode(u8* srcBuffer, u8* dstBuffer, u32 srcLength, u32 dstLengt
+ }
+ 
+ void JKRDecomp::decodeSZP(u8* src, u8* dst, u32 srcLength, u32 dstLength) {
++    ZoneScopedN("load: decompress Yay0");
+     int srcChunkOffset;
+     int count;
+     int dstOffset;
+@@ -218,6 +223,7 @@ void JKRDecomp::decodeSZP(u8* src, u8* dst, u32 srcLength, u32 dstLength) {
+ }
+ 
+ void JKRDecomp::decodeSZS(u8* src_buffer, u8* dst_buffer, u32 srcSize, u32 dstSize) {
++    ZoneScopedN("load: decompress Yaz0");
+     u8* decompEnd;
+     u8* copyStart;
+     s32 copyByteCount;
+diff --git a/libs/JSystem/src/JUtility/JUTFader.cpp b/libs/JSystem/src/JUtility/JUTFader.cpp
+index cf9a9e2364d..f31398388a5 100644
+--- a/libs/JSystem/src/JUtility/JUTFader.cpp
++++ b/libs/JSystem/src/JUtility/JUTFader.cpp
+@@ -95,6 +95,10 @@ void JUTFader::draw() {
+     }
+ }
+ 
++#if defined(__ORBIS__)
++extern "C" void ps4prof_scene_mark(const char* step) noexcept;
++#endif
++
+ bool JUTFader::startFadeIn(int duration) {
+     bool statusCheck = mStatus == 0;
+ 
+@@ -102,6 +106,9 @@ bool JUTFader::startFadeIn(int duration) {
+         mStatus = FadeIn;
+         mTimer = 0;
+         mDuration = duration;
++#if defined(__ORBIS__)
++        ps4prof_scene_mark("fader: fade-in starts");
++#endif
+     }
+ 
+     return statusCheck;
+@@ -114,6 +121,9 @@ bool JUTFader::startFadeOut(int duration) {
+         mStatus = FadeOut;
+         mTimer = 0;
+         mDuration = duration;
++#if defined(__ORBIS__)
++        ps4prof_scene_mark("fader: fade-out starts");
++#endif
+     }
+ 
+     return statusCheck;
+diff --git a/ps4/Platform.cmake b/ps4/Platform.cmake
+new file mode 100644
+index 00000000000..730fe67d767
+--- /dev/null
++++ b/ps4/Platform.cmake
+@@ -0,0 +1,207 @@
++# PS4 application integration (OpenOrbis homebrew), after ps5/Platform.cmake. Desktop builds do not
++# include this file. Configured by the dusklight-ps4 project's tools/build-game.sh with DolphinPS4's
++# toolchain (ps4-love-modern.cmake), whose project include (ps4-love-style.cmake) supplies the
++# runtime fixes, linker script, Mesa link and eboot step used here.
++include(FetchContent)
++
++set(PS4_PORT_ROOT "" CACHE PATH "dusklight-ps4 project root (prebuilt Dawn, SDL3 and Mesa)")
++set(PS4_DAWN_BUILD_DIR "${PS4_PORT_ROOT}/build/dawn" CACHE PATH "Cross-built Dawn directory")
++set(PS4_DAWN_SOURCE_DIR "${PS4_PORT_ROOT}/src/dawn" CACHE PATH "Dawn source directory")
++
++add_compile_options(-ffunction-sections -fdata-sections -fno-omit-frame-pointer)
++
++# The executable links with ld.lld directly, which takes no -pthread (FindThreads' choice for this
++# clang): threads are the OpenOrbis libpthread stubs. FindThreads keeps an existing target.
++add_library(Threads::Threads INTERFACE IMPORTED GLOBAL)
++set_target_properties(Threads::Threads PROPERTIES INTERFACE_LINK_LIBRARIES pthread)
++
++# Dawn, built separately by tools/build-dawn.sh, as on PS5.
++if (EXISTS "${PS4_DAWN_BUILD_DIR}/gen/include/dawn/webgpu_cpp.h")
++    add_library(webgpu_dawn STATIC IMPORTED GLOBAL)
++    set_target_properties(webgpu_dawn PROPERTIES
++        IMPORTED_LOCATION "${PS4_DAWN_BUILD_DIR}/src/dawn/native/libwebgpu_dawn.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${PS4_DAWN_SOURCE_DIR}/include;${PS4_DAWN_BUILD_DIR}/gen/include"
++    )
++    add_library(dawn::webgpu_dawn ALIAS webgpu_dawn)
++    add_library(ps4_dawn_headers INTERFACE)
++    add_library(dawn::dawncpp_headers ALIAS ps4_dawn_headers)
++    target_include_directories(ps4_dawn_headers INTERFACE
++        "${PS4_DAWN_SOURCE_DIR}/include" "${PS4_DAWN_BUILD_DIR}/gen/include")
++else ()
++    message(FATAL_ERROR "No PS4 Dawn build in ${PS4_DAWN_BUILD_DIR}: run tools/build-dawn.sh")
++endif ()
++
++# Tracy instrumentation is disabled and only needs headers.
++set(TRACY_ENABLE OFF CACHE BOOL "Enable Tracy profiling" FORCE)
++FetchContent_Declare(tracy
++    URL https://github.com/wolfpld/tracy/archive/refs/tags/v0.14.1.zip
++    URL_HASH SHA256=908f3a2917fa86a247abfcf85dcf04bad1db6986a4d40f94b70512f3e9e98d5b
++    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
++    SOURCE_SUBDIR ps4-headers-only
++)
++FetchContent_MakeAvailable(tracy)
++add_library(ps4_tracy_headers INTERFACE)
++add_library(Tracy::TracyClient ALIAS ps4_tracy_headers)
++add_library(TracyClient ALIAS ps4_tracy_headers)
++target_include_directories(ps4_tracy_headers SYSTEM INTERFACE "${tracy_SOURCE_DIR}/public")
++# The zones and frame marks feed the PS4 profiler instead (ps4/prof): its tracy/Tracy.hpp comes
++# first and includes Tracy's.
++target_include_directories(ps4_tracy_headers BEFORE INTERFACE "${CMAKE_CURRENT_LIST_DIR}/prof")
++target_compile_definitions(ps4_tracy_headers INTERFACE PS4_PROFILER=1)
++
++# Developer tools (tools/build-game.sh FLAVOR=dev, the default): the profiler (frame statistics,
++# zones, sampler), the heap checks of DolphinPS4's runtime on every allocation, the frame counter
++# in the log, INFO logging. The release ("Dusklight", FLAVOR=final) has none of them. The zones'
++# code stays compiled (switched off) in both, so the PGO profile matches either build.
++option(PS4_DEV_TOOLS "Developer tools: profiler, heap checks, diagnostic logs" ON)
++if(PS4_DEV_TOOLS)
++    add_compile_definitions(PS4_DEV_TOOLS=1)
++else()
++    add_compile_definitions(PS4_DEV_TOOLS=0 PS4_HEAP_CHECKS=0)
++endif()
++
++# No Discord IPC, Sentry or desktop crash handlers on the console.
++set(BOREALIS_ENABLE_DISCORD OFF CACHE BOOL "Build Discord integration" FORCE)
++set(BOREALIS_ENABLE_SENTRY OFF CACHE BOOL "Build Sentry integration" FORCE)
++set(BOREALIS_ENABLE_CRASH OFF CACHE BOOL "Build desktop crash handlers" FORCE)
++add_library(ps4_crash STATIC "${CMAKE_CURRENT_LIST_DIR}/crash.cpp")
++add_library(borealis::crash ALIAS ps4_crash)
++
++# Raw GameCube ISOs and decrypted Wii ISOs, through the PS5 port's bounded C++ reader extended to
++# Wii (ps4/disc/raw_disc.cpp) in place of nod (Rust).
++FetchContent_Declare(aurora_nod
++    GIT_REPOSITORY https://github.com/encounter/nod.git
++    GIT_TAG ebd80cac99b48a323200d84365e07a58cc27412d
++    SOURCE_SUBDIR ps4-header-only
++)
++FetchContent_MakeAvailable(aurora_nod)
++add_library(ps4_raw_disc STATIC "${CMAKE_CURRENT_LIST_DIR}/disc/raw_disc.cpp")
++target_include_directories(ps4_raw_disc PUBLIC "${aurora_nod_SOURCE_DIR}/nod-ffi/include")
++target_link_libraries(ps4_raw_disc PRIVATE ps4_tracy_headers)
++add_library(nod::nod ALIAS ps4_raw_disc)
++add_library(nod::nod_static ALIAS ps4_raw_disc)
++
++# The game executable: DolphinPS4's runtime fixes, Dawn, RADV and the console's libraries, then
++# eboot.bin (ps4-love-style.cmake).
++function(ps4_finish_game target)
++    target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/main.cpp" ${PS4_RUNTIME_SOURCES}
++        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/native/realpath.c"
++        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/prof/ps4_profiler.cpp"
++        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tpak.cpp")
++    target_link_libraries(${target} PRIVATE ps4_tracy_headers)
++    # musl's realpath needs /proc (ps4/native/realpath.c); std::filesystem::canonical uses it.
++    target_link_options(${target} PRIVATE "LINKER:--wrap=realpath")
++    if (PS4_PGO STREQUAL "generate")
++        target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/pgo.cpp")
++        set_source_files_properties("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/prof/ps4_profiler.cpp"
++            PROPERTIES COMPILE_DEFINITIONS PS4_PGO_GENERATE=1)
++        target_link_libraries(${target} PRIVATE "${PS4_PROFILE_RT}")
++    endif ()
++    ps4_link_mesa(${target})
++    target_link_libraries(${target} PRIVATE
++        z SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet pthread)
++    ps4_add_code_mods(${target})
++    ps4_add_eboot(${target})
++endfunction()
++
++# ---------------------------------------------------------------------------------------------
++# Profile-guided optimisation (tools/build-game.sh PGO=generate|use). The instrumented build keeps
++# the profile counters and their bounds in .data (orphan sections would land past the loaded
++# image) and links compiler-rt's profile runtime (tools/build-profile-rt.sh).
++set(PS4_PGO "" CACHE STRING "Profile-guided optimisation: empty, generate or use")
++set(PS4_PROFILE_RT "" CACHE FILEPATH "compiler-rt profile runtime for the PS4")
++if (PS4_PGO STREQUAL "generate")
++    file(READ "${PS4_LINK_SCRIPT}" _ps4_script)
++    if (NOT _ps4_script MATCHES "__llvm_prf_cnts")
++        set(_ps4_prf "")
++        foreach (_section cnts data bits vnds names vtab vns)
++            string(APPEND _ps4_prf "\n\t\t. = ALIGN(8);\n\t\t__start___llvm_prf_${_section} = .;\n\t\tKEEP(*(__llvm_prf_${_section}))\n\t\t__stop___llvm_prf_${_section} = .;")
++        endforeach ()
++        string(REPLACE "*(.data .data.*)" "*(.data .data.*)${_ps4_prf}" _ps4_script "${_ps4_script}")
++        file(WRITE "${PS4_LINK_SCRIPT}" "${_ps4_script}")
++    endif ()
++endif ()
++
++# ---------------------------------------------------------------------------------------------
++# Code mods. The PS4 cannot load libraries, so they are linked into the game: each mod becomes an
++# object library with its five exports renamed (ps4/static_mods.cpp lists them), and its package's
++# mod.so holds the module's key (src/dusk/mods/loader/static_module.hpp).
++if (DUSK_ENABLE_CODE_MODS)
++    # Linker script: sections the OpenOrbis script does not list would be placed past the data
++    # segment's file image and start out as zeros on the console. Mod metadata records (with the
++    # bounds mods/meta.hpp expects), the symbol manifest's descriptor and its reserved storage.
++    file(READ "${PS4_LINK_SCRIPT}" _ps4_script)
++    if (NOT _ps4_script MATCHES "modmeta")
++    string(REPLACE "*(.data .data.*)"
++        "*(.data .data.*)\n\t\t. = ALIGN(8);\n\t\tKEEP(*(symdbh))\n\t\t. = ALIGN(8);\n\t\t__start_modmeta = .;\n\t\tKEEP(*(modmeta))\n\t\t__stop_modmeta = .;"
++        _ps4_script "${_ps4_script}")
++    string(REPLACE "*(.rodata .rodata.*)" "*(.rodata .rodata.*)\n\t\t. = ALIGN(16);\n\t\tKEEP(*(ps4_symdb))"
++        _ps4_script "${_ps4_script}")
++    file(WRITE "${PS4_LINK_SCRIPT}" "${_ps4_script}")
++    endif ()
++
++    # Space for the symbol manifest, written after linking (tools/embed-manifest.py).
++    set(PS4_SYMDB_BYTES 8388608 CACHE STRING "Bytes reserved in the image for the symbol manifest")
++    set(PS4_SYMGEN "" CACHE FILEPATH "symgen executable (host)")
++    configure_file("${CMAKE_CURRENT_LIST_DIR}/symdb_storage.cpp.in"
++        "${CMAKE_BINARY_DIR}/ps4_symdb_storage.cpp" @ONLY)
++
++    set(PS4_TWILIGHT_HD_DIR "" CACHE PATH "Twilight HD source (github.com/OTPR26/twilight-hd-hud)")
++    # The libraries besides the game whose functions the linked mods hook, which keep hook-safe
++    # code (no automatic inlining, patchable entries; CMakeLists.txt). Twilight HD: JUTResFont,
++    # J2DPrint/J2DScreen/J2DGrafContext, JMessage::TControl, PADSetVirtualStatus/PADClearVirtualStatus.
++    set(PS4_HOOKED_LIBRARIES JSystem_JUtility JSystem_J2DGraph JSystem_JMessage aurora_pad)
++endif ()
++
++function(ps4_setup_symbol_manifest target)
++    target_sources(${target} PRIVATE "${CMAKE_BINARY_DIR}/ps4_symdb_storage.cpp")
++    # Debug information lets symgen find the hookable functions; it is not loaded on the console.
++    add_custom_command(TARGET ${target} POST_BUILD
++        COMMAND python3 -I "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tools/embed-manifest.py"
++            --symgen "${PS4_SYMGEN}" --elf "$<TARGET_FILE:${target}>"
++        COMMENT "Writing the symbol manifest into the image"
++        VERBATIM)
++endfunction()
++
++function(ps4_add_code_mods target)
++    if (NOT DUSK_ENABLE_CODE_MODS OR NOT PS4_TWILIGHT_HD_DIR)
++        return()
++    endif ()
++    set(_dir "${PS4_TWILIGHT_HD_DIR}")
++    add_library(ps4_mod_twilight_hd OBJECT
++        "${_dir}/src/config.cpp" "${_dir}/src/font_override.cpp" "${_dir}/src/item_slot_hooks.cpp"
++        "${_dir}/src/mod.cpp" "${_dir}/src/ui.cpp" "${_dir}/src/update_service.cpp"
++        "${_dir}/src/wolf_touch_icons.cpp")
++    target_compile_features(ps4_mod_twilight_hd PRIVATE cxx_std_20)
++    target_include_directories(ps4_mod_twilight_hd PRIVATE "${_dir}/src" "${CMAKE_SOURCE_DIR}/src")
++    target_link_libraries(ps4_mod_twilight_hd PRIVATE dusklight_mod_feature_game dusklight_game_headers)
++    target_compile_definitions(ps4_mod_twilight_hd PRIVATE
++        mod_meta=twilight_hd_hud_mod_meta mod_ctx=twilight_hd_hud_mod_ctx
++        mod_initialize=twilight_hd_hud_mod_initialize mod_update=twilight_hd_hud_mod_update
++        mod_shutdown=twilight_hd_hud_mod_shutdown)
++    target_link_libraries(${target} PRIVATE ps4_mod_twilight_hd)
++    target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/static_mods.cpp")
++    target_compile_definitions(${target} PRIVATE PS4_MOD_TWILIGHT_HD=1)
++endfunction()
++
++# funchook on the PS4: ps4/funchook_ps4.c replaces its Unix layer (no /proc maps, no libdl).
++function(ps4_adapt_funchook)
++    if (NOT TARGET funchook-static)
++        return()
++    endif ()
++    get_target_property(_funchook_dir funchook-static SOURCE_DIR)
++    set_source_files_properties("${_funchook_dir}/src/funchook_unix.c"
++        TARGET_DIRECTORY funchook-static PROPERTIES HEADER_FILE_ONLY ON)
++    target_sources(funchook-static PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/funchook_ps4.c")
++    target_include_directories(funchook-static PRIVATE "${_funchook_dir}/src")
++    get_target_property(_funchook_libs funchook-static LINK_LIBRARIES)
++    list(REMOVE_ITEM _funchook_libs dl)
++    set_target_properties(funchook-static PROPERTIES LINK_LIBRARIES "${_funchook_libs}")
++    get_target_property(_funchook_interface funchook-static INTERFACE_LINK_LIBRARIES)
++    if (_funchook_interface)
++        list(TRANSFORM _funchook_interface REPLACE "^dl$" "")
++        list(TRANSFORM _funchook_interface REPLACE "^\\$<LINK_ONLY:dl>$" "")
++        list(REMOVE_ITEM _funchook_interface "")
++        set_target_properties(funchook-static PROPERTIES INTERFACE_LINK_LIBRARIES "${_funchook_interface}")
++    endif ()
++endfunction()
+diff --git a/ps4/crash.cpp b/ps4/crash.cpp
+new file mode 100644
+index 00000000000..c2db97180b2
+--- /dev/null
++++ b/ps4/crash.cpp
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: MIT
++// The PS4's termination goes through the shell, as on PS5 (ps5/crash.cpp): an unhandled C++
++// exception is logged and the title asks to be closed.
++#include <cstdio>
++#include <exception>
++
++extern "C" int sceSystemServiceLoadExec(const char*, char* const*);
++extern "C" int sceKernelUsleep(unsigned int);
++
++namespace borealis::crash {
++void install() {
++    std::set_terminate([] {
++        const char* what = "none active (std::terminate called directly)";
++        if (auto current = std::current_exception()) {
++            what = "(not a std::exception)";
++            try {
++                std::rethrow_exception(current);
++            } catch (const std::exception& e) {
++                what = e.what();
++            } catch (...) {
++            }
++        }
++        std::fprintf(stderr, "[Dusklight PS4] Unhandled C++ exception: %s; closing through system service\n", what);
++        std::fflush(nullptr);
++        sceSystemServiceLoadExec("exit", nullptr);
++        for (;;) sceKernelUsleep(100000);
++    });
++}
++}
+diff --git a/ps4/default-config.json b/ps4/default-config.json
+new file mode 100644
+index 00000000000..d27878d55ab
+--- /dev/null
++++ b/ps4/default-config.json
+@@ -0,0 +1,14 @@
++{
++  "game.language": 0,
++  "game.enableFrameInterpolation": 0,
++  "video.maxFrameRate": 60,
++  "game.enableFpsOverlay": true,
++  "game.enableControllerToasts": false,
++  "game.enableTextureReplacements": false,
++  "game.internalResolutionScale": 0,
++  "backend.skipPreLaunchUI": false,
++  "backend.checkForUpdates": false,
++  "backend.checkForModUpdates": false,
++  "video.uiScale": 100,
++  "game.fastTransitions": true
++}
+diff --git a/ps4/disc/raw_disc.cpp b/ps4/disc/raw_disc.cpp
+new file mode 100644
+index 00000000000..7a1263b1225
+--- /dev/null
++++ b/ps4/disc/raw_disc.cpp
+@@ -0,0 +1,394 @@
++// SPDX-License-Identifier: MIT
++// Application disc backend for raw GameCube ISOs and decrypted Wii ISOs, the PS5 port's
++// ps5/disc/raw_gamecube.cpp extended to Wii discs. Implements the nod C API subset used by
++// Aurora/Borealis; no compressed images.
++//
++// A Wii image must have its partition data decrypted beforehand, so the console needs no keys:
++// `nodtool convert --decrypt <disc> <out.iso>` (github.com/encounter/nod) writes one. Its data
++// partition keeps the disc's layout: clusters of 0x8000 bytes, each a 0x400-byte hash block and
++// 0x7C00 bytes of data, and boot header, DOL, FST and file offsets stored shifted right by 2.
++#include <nod.h>
++#include <tracy/Tracy.hpp>
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <list>
++#include <memory>
++#include <mutex>
++#include <new>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#if defined(__ORBIS__)
++extern "C" {
++size_t sceKernelGetDirectMemorySize(void);
++int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t* phys);
++int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align);
++}
++#endif
++
++namespace {
++thread_local std::string error;
++NodResult fail(NodResult code, const char* message) { error = message; return code; }
++uint32_t be32(const uint8_t* p) {
++    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++}
++constexpr uint32_t GcnMagic = 0xc2339f3d, WiiMagic = 0x5d1c9ea3;
++
++// When the image was last read from the drive: texture replacement loads wait while the game
++// reads (ps4_disc_busy_until_ns), so one drive does not seek between both during a scene change.
++std::atomic<uint64_t> g_busyUntilNs{0};
++uint64_t now_ns() {
++    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++constexpr uint64_t BusyWindowNs = 250'000'000;
++
++// The image in 1 MiB blocks, the most recently used kept, for all opens of the image (the game,
++// its inspections): the console's C library splits each stream read into many small system
++// calls, so a few large reads beat many small ones (an area's archives, the FST and the DOL are
++// read in 0x7C00-byte cluster pieces), and a hard drive read is ~50 ms. 256 MiB from the
++// console's direct memory keep the areas of a town as one walks between them.
++class BlockCache {
++public:
++    static constexpr uint64_t BlockSize = 1 << 20;
++
++    // Copies [offset, offset + length) of the image (`size` bytes, read with `stream`).
++    bool copy(const NodDiscStream& stream, uint64_t size, uint64_t offset, uint8_t* out, size_t length) {
++        std::lock_guard guard(m_lock);
++        if (m_slots.empty() && !allocate()) return false;
++        while (length) {
++            const uint8_t* data = block(stream, size, offset / BlockSize);
++            if (data == nullptr) return false;
++            const size_t within = size_t(offset % BlockSize);
++            const size_t n = size_t(std::min<uint64_t>(length, std::min<uint64_t>(BlockSize, size - offset / BlockSize * BlockSize) - within));
++            std::memcpy(out, data + within, n);
++            offset += n; out += n; length -= n;
++        }
++        return true;
++    }
++
++private:
++    struct Slot {
++        uint64_t size = 0, index = 0;  // the image's size and the block's index; size 0: free
++        std::list<size_t>::iterator recent;
++    };
++    std::mutex m_lock;
++    uint8_t* m_arena = nullptr;
++    std::vector<Slot> m_slots;
++    std::list<size_t> m_recent;  // slot numbers, most recently used first
++    std::unordered_map<uint64_t, size_t> m_index;
++
++    static uint64_t key(uint64_t size, uint64_t index) { return index ^ (size * 0x9E3779B97F4A7C15ull); }
++
++    bool allocate() {
++        size_t slots = 0;
++#if defined(__ORBIS__)
++        constexpr size_t DirectBytes = 256u << 20;
++        off_t phys = 0;
++        void* base = nullptr;
++        if (sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()), DirectBytes, 2u << 20, 0, &phys) == 0 &&
++            sceKernelMapDirectMemory(&base, DirectBytes, 0x3 /* CPU read/write */, 0, phys, 2u << 20) == 0) {
++            m_arena = static_cast<uint8_t*>(base);
++            slots = DirectBytes / BlockSize;
++        }
++#endif
++        if (m_arena == nullptr) {
++            slots = 64;
++            m_arena = static_cast<uint8_t*>(std::malloc(slots * BlockSize));
++            if (m_arena == nullptr) return false;
++        }
++        m_slots.resize(slots);
++        for (size_t i = 0; i < slots; ++i) {
++            m_recent.push_back(i);
++            m_slots[i].recent = std::prev(m_recent.end());
++        }
++        return true;
++    }
++
++    const uint8_t* block(const NodDiscStream& stream, uint64_t size, uint64_t index) {
++        if (const auto it = m_index.find(key(size, index)); it != m_index.end()) {
++            Slot& slot = m_slots[it->second];
++            if (slot.size == size && slot.index == index) {
++                m_recent.splice(m_recent.begin(), m_recent, slot.recent);
++                return m_arena + it->second * BlockSize;
++            }
++        }
++        // The least recently used slot takes the block.
++        const size_t number = m_recent.back();
++        Slot& slot = m_slots[number];
++        if (slot.size != 0) m_index.erase(key(slot.size, slot.index));
++        slot.size = 0;
++        uint8_t* data = m_arena + number * BlockSize;
++        const uint64_t start = index * BlockSize;
++        const size_t length = size_t(std::min<uint64_t>(BlockSize, size - start));
++        {
++            ZoneScopedN("disc: read 1 MiB of the image");
++            g_busyUntilNs.store(now_ns() + BusyWindowNs, std::memory_order_relaxed);
++            for (size_t done = 0; done < length;) {
++                const auto n = stream.read_at(stream.user_data, start + done, data + done, length - done);
++                if (n <= 0 || uint64_t(n) > length - done) return nullptr;
++                done += size_t(n);
++            }
++            g_busyUntilNs.store(now_ns() + BusyWindowNs, std::memory_order_relaxed);
++        }
++        slot.size = size;
++        slot.index = index;
++        m_index[key(size, index)] = number;
++        m_recent.splice(m_recent.begin(), m_recent, slot.recent);
++        return data;
++    }
++};
++BlockCache g_cache;
++constexpr uint64_t WiiCluster = 0x8000, WiiClusterHash = 0x400, WiiClusterData = 0x7c00;
++constexpr uint64_t WiiPartitionInfo = 0x40000;
++struct Entry { uint32_t name; uint64_t offset; uint32_t size; bool directory; };
++struct Disc {
++    NodDiscStream stream{};
++    uint64_t size{};
++    NodDiscHeader header{};
++    std::vector<uint8_t> fst, dol;
++    std::vector<Entry> entries;
++    bool ownsStream{};
++    // A Wii disc's data partition: where its clusters start in the image, and its bytes of data.
++    bool wii{};
++    uint64_t dataStart{}, dataSize{};
++    const char* reason = "Requires a raw GameCube ISO or a decrypted Wii ISO with bounded FST/DOL";
++    ~Disc() { if (ownsStream) stream.close(stream.user_data); }
++    // Bytes of the image itself.
++    bool exact(uint64_t offset, uint8_t* out, size_t length) {
++        if (offset > size || length > size - offset) return false;
++        return g_cache.copy(stream, size, offset, out, length);
++    }
++    // Bytes of the data partition: the image for GameCube, the clusters' data for Wii.
++    uint64_t partitionSize() const { return wii ? dataSize : size; }
++    bool read(uint64_t offset, uint8_t* out, size_t length) {
++        if (!wii) return exact(offset, out, length);
++        if (offset > dataSize || length > dataSize - offset) return false;
++        while (length) {
++            const uint64_t cluster = offset / WiiClusterData, within = offset % WiiClusterData;
++            const size_t n = size_t(std::min<uint64_t>(length, WiiClusterData - within));
++            if (!exact(dataStart + cluster * WiiCluster + WiiClusterHash + within, out, n)) return false;
++            offset += n; out += n; length -= n;
++        }
++        return true;
++    }
++    const char* name(const Entry& e) const { return reinterpret_cast<const char*>(fst.data() + e.name); }
++    // The data partition of a Wii disc (partition type 0 in the first table), checked to be
++    // decrypted: its boot header must name the disc's game.
++    bool findWiiData() {
++        std::array<uint8_t, 8> group{};
++        if (!exact(WiiPartitionInfo, group.data(), group.size())) return false;
++        const uint32_t count = be32(group.data());
++        const uint64_t table = uint64_t(be32(group.data() + 4)) << 2;
++        if (count == 0 || count > 64) return false;
++        for (uint32_t i = 0; i < count; ++i) {
++            std::array<uint8_t, 8> entry{};
++            if (!exact(table + i * 8, entry.data(), entry.size())) return false;
++            if (be32(entry.data() + 4) != 0) continue;
++            const uint64_t partition = uint64_t(be32(entry.data())) << 2;
++            std::array<uint8_t, 8> data{};
++            if (!exact(partition + 0x2b8, data.data(), data.size())) return false;
++            dataStart = partition + (uint64_t(be32(data.data())) << 2);
++            const uint64_t encrypted = uint64_t(be32(data.data() + 4)) << 2;
++            if (dataStart > size) return false;
++            // Whole clusters the image holds.
++            dataSize = std::min(encrypted, size - dataStart) / WiiCluster * WiiClusterData;
++            NodDiscHeader inner{};
++            if (!read(0, reinterpret_cast<uint8_t*>(&inner), sizeof(inner)) ||
++                std::memcmp(inner.game_id, header.game_id, sizeof(header.game_id)) != 0 ||
++                be32(inner.wii_magic) != WiiMagic) {
++                reason = "Encrypted Wii image: decrypt it first with `nodtool convert --decrypt`";
++                return false;
++            }
++            return true;
++        }
++        return false;
++    }
++    // Opening a disc reads its header only: the game inspects the image several times before it
++    // uses it (each a fresh open), and the FST and DOL are megabytes. They are read when the data
++    // partition is first opened (loadContents).
++    bool loadHeader() {
++        if (!exact(0, reinterpret_cast<uint8_t*>(&header), sizeof(header))) return false;
++        if (std::memcmp(header.game_id, "WBFS", 4) == 0) {
++            reason = "WBFS image: convert it to a decrypted ISO with `nodtool convert --decrypt`";
++            return false;
++        }
++        if (be32(header.wii_magic) == WiiMagic) {
++            wii = true;
++            if (!findWiiData()) return false;
++        } else if (be32(header.gcn_magic) != GcnMagic) {
++            return false;
++        }
++        return true;
++    }
++    std::once_flag contentsOnce;
++    bool contentsOk = false;
++    bool ensureContents() {
++        std::call_once(contentsOnce, [this] { contentsOk = loadContents(); });
++        return contentsOk;
++    }
++    bool loadContents() {
++        // Wii boot headers and FSTs store offsets and sizes divided by 4.
++        const unsigned shift = wii ? 2 : 0;
++        const uint64_t limit = partitionSize();
++        std::array<uint8_t, 12> boot{};
++        if (!read(0x420, boot.data(), boot.size())) return false;
++        const uint64_t dolOffset = uint64_t(be32(boot.data())) << shift;
++        const uint64_t fstOffset = uint64_t(be32(boot.data() + 4)) << shift;
++        const uint64_t fstSize = uint64_t(be32(boot.data() + 8)) << shift;
++        if (fstSize < 12 || fstSize > 64 * 1024 * 1024 || fstOffset > limit || fstSize > limit - fstOffset) return false;
++        fst.resize(fstSize);
++        if (!read(fstOffset, fst.data(), fst.size())) return false;
++        const uint32_t count = be32(fst.data() + 8);
++        if (count == 0 || count > fstSize / 12 || fst[0] != 1) return false;
++        const uint32_t names = count * 12;
++        std::vector<uint32_t> directoryEnds{count};
++        for (uint32_t i = 0; i < count; ++i) {
++            const uint8_t* p = fst.data() + i * 12;
++            if (p[0] > 1) return false;
++            const uint32_t stringOffset = be32(p) & 0xffffff;
++            if (stringOffset >= fstSize - names) return false;
++            // A directory's offset and size are entry indices, not shifted.
++            const bool directory = p[0] == 1;
++            Entry e{names + stringOffset, uint64_t(be32(p + 4)) << (directory ? 0 : shift), be32(p + 8), directory};
++            if (!memchr(fst.data() + e.name, 0, fstSize - e.name)) return false;
++            if (i == 0) { if (e.offset != 0 || e.size != count) return false; }
++            else {
++                while (i >= directoryEnds.back()) directoryEnds.pop_back();
++                if (e.directory) {
++                    if (e.offset >= i || e.size <= i || e.size > directoryEnds.back()) return false;
++                    directoryEnds.push_back(e.size);
++                } else if (e.offset > limit || e.size > limit - e.offset) return false;
++            }
++            entries.push_back(e);
++        }
++        // DOL section ranges are offsets relative to the DOL, not load addresses.
++        std::array<uint8_t, 0x100> dolHeader{};
++        if (!read(dolOffset, dolHeader.data(), dolHeader.size())) return false;
++        uint64_t dolSize = dolHeader.size();
++        for (size_t i = 0; i < 18; ++i) {
++            const uint32_t offset = be32(dolHeader.data() + i * 4);
++            const uint32_t length = be32(dolHeader.data() + 0x90 + i * 4);
++            if (length) {
++                if (offset < dolHeader.size()) return false;
++                dolSize = std::max(dolSize, uint64_t(offset) + length);
++            }
++        }
++        if (dolSize > 64 * 1024 * 1024 || dolOffset > limit || dolSize > limit - dolOffset) return false;
++        dol.resize(dolSize);
++        return read(dolOffset, dol.data(), dol.size());
++    }
++};
++}
++struct NodHandle {
++    enum class Kind { Disc, Partition, File } kind;
++    std::shared_ptr<Disc> disc;
++    uint64_t offset{}, size{}, position{};
++};
++
++extern "C" {
++const char* nod_error_message() { return error.empty() ? nullptr : error.c_str(); }
++NodResult nod_disc_open_stream(const NodDiscStream* stream, const NodDiscOptions*, NodHandle** out) {
++    error.clear();
++    if (out) *out = nullptr;
++    if (!stream || !out || !stream->read_at || !stream->stream_len || !stream->close)
++        return fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid stream callbacks");
++    // nod owns a valid stream even when format detection fails.
++    bool adopted = false;
++    try {
++        auto disc = std::make_shared<Disc>();
++        disc->stream = *stream; disc->ownsStream = true; adopted = true;
++        const int64_t length = stream->stream_len(stream->user_data);
++        if (length < 0) return fail(NOD_RESULT_ERR_IO, "Cannot determine disc length");
++        disc->size = uint64_t(length);
++        if (!disc->loadHeader()) return fail(NOD_RESULT_ERR_FORMAT, disc->reason);
++        *out = new NodHandle{NodHandle::Kind::Disc, disc, 0, disc->size};
++        return NOD_RESULT_OK;
++    } catch (...) {
++        if (!adopted) stream->close(stream->user_data);
++        return fail(NOD_RESULT_ERR_OTHER, "Cannot allocate disc metadata");
++    }
++}
++void nod_free(NodHandle* handle) { delete handle; }
++NodResult nod_disc_open_partition_kind(NodHandle* disc, uint32_t kind, const NodPartitionOptions*, NodHandle** out) {
++    error.clear(); if (out) *out = nullptr;
++    if (!disc || !out || disc->kind != NodHandle::Kind::Disc) return fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid disc");
++    if (kind != NOD_PARTITION_KIND_DATA) return fail(NOD_RESULT_ERR_NOT_FOUND, "Only the data partition is available");
++    if (!disc->disc->ensureContents()) return fail(NOD_RESULT_ERR_FORMAT, disc->disc->reason);
++    *out = new (std::nothrow) NodHandle{NodHandle::Kind::Partition, disc->disc, 0, disc->disc->partitionSize()};
++    return *out ? NOD_RESULT_OK : fail(NOD_RESULT_ERR_OTHER, "Allocation failed");
++}
++NodResult nod_disc_open_partition(NodHandle* disc, uint32_t index, const NodPartitionOptions* options, NodHandle** out) {
++    if (index != 0) { if (out) *out = nullptr; return fail(NOD_RESULT_ERR_NOT_FOUND, "Invalid partition index"); }
++    return nod_disc_open_partition_kind(disc, NOD_PARTITION_KIND_DATA, options, out);
++}
++NodResult nod_partition_open_file(NodHandle* part, uint32_t index, NodHandle** out) {
++    error.clear(); if (out) *out = nullptr;
++    if (!part || !out || part->kind != NodHandle::Kind::Partition) return fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid partition");
++    if (index >= part->disc->entries.size() || part->disc->entries[index].directory) return fail(NOD_RESULT_ERR_NOT_FOUND, "Not a file");
++    const auto& e = part->disc->entries[index];
++    *out = new (std::nothrow) NodHandle{NodHandle::Kind::File, part->disc, e.offset, e.size};
++    return *out ? NOD_RESULT_OK : fail(NOD_RESULT_ERR_OTHER, "Allocation failed");
++}
++int64_t nod_read(NodHandle* h, uint8_t* buffer, size_t length) {
++    error.clear();
++    if (!h || (!buffer && length)) { fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid read"); return -1; }
++    const size_t count = std::min<uint64_t>(length, h->size - h->position);
++    // The disc handle reads the image; partitions and files read the partition's data.
++    const bool ok = h->kind == NodHandle::Kind::Disc ? h->disc->exact(h->offset + h->position, buffer, count)
++                                                     : h->disc->read(h->offset + h->position, buffer, count);
++    if (!ok) { fail(NOD_RESULT_ERR_IO, "Disc read failed"); return -1; }
++    h->position += count; return count;
++}
++int64_t nod_seek(NodHandle* h, int64_t offset, int32_t whence) {
++    error.clear();
++    if (!h || whence < 0 || whence > 2) return -1;
++    const uint64_t base = whence == 0 ? 0 : (whence == 1 ? h->position : h->size);
++    uint64_t position;
++    if (offset < 0) {
++        const uint64_t negative = uint64_t(-(offset + 1)) + 1;
++        if (negative > base) return -1;
++        position = base - negative;
++    } else {
++        if (uint64_t(offset) > h->size - base) return -1;
++        position = base + uint64_t(offset);
++    }
++    if (position > h->size || position > uint64_t(INT64_MAX)) return -1;
++    h->position = position; return position;
++}
++NodResult nod_disc_header(const NodHandle* h, NodDiscHeader* out) {
++    error.clear();
++    if (!h || !out || h->kind != NodHandle::Kind::Disc) return fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid disc header request");
++    *out = h->disc->header; return NOD_RESULT_OK;
++}
++uint64_t nod_disc_size(const NodHandle* h) { return h && h->kind == NodHandle::Kind::Disc ? h->size : 0; }
++NodResult nod_partition_meta(const NodHandle* h, NodPartitionMeta* out) {
++    error.clear();
++    if (!h || !out || h->kind != NodHandle::Kind::Partition) return fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid partition metadata request");
++    *out = {}; out->raw_fst = {h->disc->fst.data(), h->disc->fst.size()};
++    out->raw_dol = {h->disc->dol.data(), h->disc->dol.size()}; return NOD_RESULT_OK;
++}
++void nod_partition_iterate_fst(const NodHandle* h, NodFstCallback callback, void* user) {
++    error.clear();
++    if (!h || !callback || h->kind != NodHandle::Kind::Partition) { fail(NOD_RESULT_ERR_INVALID_HANDLE, "Invalid FST iterator"); return; }
++    // Like nod, root is implicit. A directory's size is its next sibling index.
++    for (uint32_t i = 1; i < h->disc->entries.size();) {
++        const auto& e = h->disc->entries[i];
++        const uint32_t next = callback(i, e.directory ? NOD_NODE_KIND_DIRECTORY : NOD_NODE_KIND_FILE,
++            h->disc->name(e), e.size, user);
++        if (next == NOD_FST_STOP) return;
++        if (next <= i) { fail(NOD_RESULT_ERR_OTHER, "FST callback must advance"); return; }
++        i = next;
++    }
++}
++}
++
++// When the drive was last busy reading the image, plus a short window (steady clock, ns): the
++// PS4 build's texture replacement loader waits until then (aurora texture_replacement.cpp).
++extern "C" uint64_t ps4_disc_busy_until_ns(void) { return g_busyUntilNs.load(std::memory_order_relaxed); }
+diff --git a/ps4/disc/raw_disc_test.cpp b/ps4/disc/raw_disc_test.cpp
+new file mode 100644
+index 00000000000..ed462b84e3c
+--- /dev/null
++++ b/ps4/disc/raw_disc_test.cpp
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: MIT
++// Host check of ps4/disc/raw_disc.cpp against a disc nodtool extracted:
++//   raw_disc_test <image.iso> <extracted dir (nodtool extract)>
++// Reads the DOL and every file through the nod API and compares them with sys/main.dol and files/.
++#include <nod.h>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace {
++int64_t read_at(void* user, uint64_t offset, void* out, size_t length) {
++    return pread(*static_cast<int*>(user), out, length, static_cast<off_t>(offset));
++}
++int64_t stream_len(void* user) {
++    struct stat st;
++    return fstat(*static_cast<int*>(user), &st) == 0 ? st.st_size : -1;
++}
++void close_stream(void* user) { close(*static_cast<int*>(user)); }
++
++std::vector<uint8_t> slurp(const std::string& path) {
++    std::ifstream in(path, std::ios::binary);
++    return {std::istreambuf_iterator<char>(in), {}};
++}
++
++struct Walk {
++    NodHandle* partition;
++    std::string root;
++    std::vector<std::pair<uint32_t, std::string>> dirs;  // end index, path
++    unsigned files = 0, mismatches = 0;
++    uint64_t bytes = 0;
++};
++
++uint32_t visit(uint32_t index, NodNodeKind kind, const char* name, uint32_t size, void* user) {
++    auto& w = *static_cast<Walk*>(user);
++    while (!w.dirs.empty() && index >= w.dirs.back().first) w.dirs.pop_back();
++    const std::string parent = w.dirs.empty() ? "" : w.dirs.back().second;
++    const std::string path = parent + "/" + name;
++    if (kind == NOD_NODE_KIND_DIRECTORY) {
++        w.dirs.emplace_back(size, path);
++        return index + 1;
++    }
++    NodHandle* file = nullptr;
++    std::vector<uint8_t> data(size);
++    bool ok = nod_partition_open_file(w.partition, index, &file) == NOD_RESULT_OK &&
++              nod_read(file, data.data(), size) == int64_t(size);
++    nod_free(file);
++    ok = ok && data == slurp(w.root + "/files" + path);
++    if (!ok && w.mismatches++ < 10) std::printf("MISMATCH %s\n", path.c_str());
++    w.files++;
++    w.bytes += size;
++    return index + 1;
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    if (argc != 3) {
++        std::fprintf(stderr, "usage: %s <image> <extracted dir>\n", argv[0]);
++        return 2;
++    }
++    static int fd = open(argv[1], O_RDONLY);
++    NodDiscStream stream{&fd, read_at, stream_len, close_stream};
++    NodHandle* disc = nullptr;
++    if (nod_disc_open_stream(&stream, nullptr, &disc) != NOD_RESULT_OK) {
++        std::printf("open failed: %s\n", nod_error_message());
++        return 1;
++    }
++    NodDiscHeader header{};
++    nod_disc_header(disc, &header);
++    std::printf("disc %.6s, %.64s\n", header.game_id, header.game_title);
++    NodHandle* partition = nullptr;
++    if (nod_disc_open_partition_kind(disc, NOD_PARTITION_KIND_DATA, nullptr, &partition) != NOD_RESULT_OK) {
++        std::printf("no data partition: %s\n", nod_error_message());
++        return 1;
++    }
++    NodPartitionMeta meta{};
++    nod_partition_meta(partition, &meta);
++    const auto dol = slurp(std::string(argv[2]) + "/sys/main.dol");
++    const bool dolOk = meta.raw_dol.size <= dol.size() &&
++                       std::memcmp(meta.raw_dol.data, dol.data(), meta.raw_dol.size) == 0;
++    std::printf("DOL %zu bytes: %s\n", static_cast<size_t>(meta.raw_dol.size), dolOk ? "matches" : "DIFFERS");
++
++    Walk walk{partition, argv[2], {}};
++    nod_partition_iterate_fst(partition, visit, &walk);
++    std::printf("%u files, %.1f MiB, %u mismatches\n", walk.files, walk.bytes / 1048576.0, walk.mismatches);
++    nod_free(partition);
++    nod_free(disc);
++    return dolOk && walk.mismatches == 0 && walk.files > 0 ? 0 : 1;
++}
+diff --git a/ps4/funchook_ps4.c b/ps4/funchook_ps4.c
+new file mode 100644
+index 00000000000..df5448cb9c3
+--- /dev/null
++++ b/ps4/funchook_ps4.c
+@@ -0,0 +1,158 @@
++/*
++ * funchook's platform layer for the PS4 build, in place of funchook_unix.c (ps4/Platform.cmake).
++ *
++ * The console has no /proc/self/maps to find free memory near a function, and the game is one
++ * statically linked image, so trampolines come from a pool reserved inside the image's own code
++ * (always within the 2 GiB a 32-bit jump reaches). The pool and patched functions are made
++ * writable with sceKernelMprotect, keeping execute permission: other threads may be running code
++ * in the same pages while a hook is written.
++ */
++#include "config.h"
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "funchook_internal.h"
++
++int32_t sceKernelMprotect(const void *addr, size_t len, int prot);
++
++#define PS4_PROT_RX 0x5  /* PROT_READ | PROT_EXEC */
++#define PS4_PROT_RWX 0x7 /* PROT_READ | PROT_WRITE | PROT_EXEC */
++/* The console's protection granularity. */
++#define PS4_PROTECT_UNIT 0x4000
++/* Dusklight creates a funchook instance, and so takes a page, per hook. */
++#define PS4_POOL_BYTES 0x200000
++#define PS4_POOL_PAGES (PS4_POOL_BYTES / PAGE_SIZE)
++
++const size_t page_size = PAGE_SIZE;
++
++/* The trampoline pool: int3-filled, in .text so it lies close to every game function. */
++__asm__(".pushsection .text.ps4_funchook_pool,\"ax\",@progbits\n"
++        ".balign 16384\n"
++        "ps4_funchook_pool:\n"
++        ".fill 2097152, 1, 0xcc\n"
++        ".popsection\n");
++extern uint8_t ps4_funchook_pool[];
++static uint8_t s_page_used[PS4_POOL_PAGES];
++static int s_pool_writable;
++static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
++
++const char *funchook_strerror(int errnum, char *buf, size_t buflen)
++{
++    snprintf(buf, buflen, "%s", strerror(errnum));
++    return buf;
++}
++
++funchook_t *funchook_alloc(void)
++{
++    return (funchook_t *)calloc(1, funchook_size);
++}
++
++int funchook_free(funchook_t *funchook)
++{
++    free(funchook);
++    return 0;
++}
++
++int funchook_page_alloc(funchook_t *funchook, funchook_page_t **page_out, uint8_t *func, ip_displacement_t *disp)
++{
++    size_t index;
++
++    (void)func;
++    (void)disp;
++    pthread_mutex_lock(&s_pool_lock);
++    if (!s_pool_writable) {
++        int32_t rv = sceKernelMprotect(ps4_funchook_pool, PS4_POOL_BYTES, PS4_PROT_RWX);
++        if (rv != 0) {
++            pthread_mutex_unlock(&s_pool_lock);
++            funchook_set_error_message(funchook, "sceKernelMprotect(trampoline pool, rwx) = 0x%x", (unsigned)rv);
++            return FUNCHOOK_ERROR_MEMORY_FUNCTION;
++        }
++        s_pool_writable = 1;
++    }
++    for (index = 0; index < PS4_POOL_PAGES && s_page_used[index]; index++) {
++    }
++    if (index == PS4_POOL_PAGES) {
++        pthread_mutex_unlock(&s_pool_lock);
++        funchook_set_error_message(funchook, "the PS4 trampoline pool (%u pages) is used up", (unsigned)PS4_POOL_PAGES);
++        return FUNCHOOK_ERROR_MEMORY_ALLOCATION;
++    }
++    s_page_used[index] = 1;
++    pthread_mutex_unlock(&s_pool_lock);
++    *page_out = (funchook_page_t *)(ps4_funchook_pool + index * page_size);
++    memset(*page_out, 0, page_size);
++    funchook_log(funchook, "  allocate page %p (size=%" PRIuPTR ")\n", (void *)*page_out, page_size);
++    return 0;
++}
++
++int funchook_page_free(funchook_t *funchook, funchook_page_t *page)
++{
++    const size_t index = (size_t)((uint8_t *)page - ps4_funchook_pool) / page_size;
++
++    (void)funchook;
++    memset(page, 0xcc, page_size);
++    pthread_mutex_lock(&s_pool_lock);
++    if (index < PS4_POOL_PAGES) {
++        s_page_used[index] = 0;
++    }
++    pthread_mutex_unlock(&s_pool_lock);
++    return 0;
++}
++
++/* The pool stays readable, writable and executable. */
++int funchook_page_protect(funchook_t *funchook, funchook_page_t *page)
++{
++    (void)funchook;
++    (void)page;
++    return 0;
++}
++
++int funchook_page_unprotect(funchook_t *funchook, funchook_page_t *page)
++{
++    (void)funchook;
++    (void)page;
++    return 0;
++}
++
++int funchook_unprotect_begin(funchook_t *funchook, mem_state_t *mstate, void *start, size_t len)
++{
++    size_t saddr = ROUND_DOWN((size_t)start, PS4_PROTECT_UNIT);
++    int32_t rv;
++
++    mstate->addr = (void *)saddr;
++    mstate->size = ROUND_UP(len + (size_t)start - saddr, PS4_PROTECT_UNIT);
++    rv = sceKernelMprotect(mstate->addr, mstate->size, PS4_PROT_RWX);
++    if (rv != 0) {
++        funchook_set_error_message(funchook, "sceKernelMprotect(%p, 0x%zx, rwx) = 0x%x", mstate->addr,
++                                   mstate->size, (unsigned)rv);
++        return FUNCHOOK_ERROR_MEMORY_FUNCTION;
++    }
++    funchook_log(funchook, "  unprotect memory %p (size=%" PRIuPTR ") <- %p (size=%" PRIuPTR ")\n",
++                 mstate->addr, mstate->size, start, len);
++    return 0;
++}
++
++int funchook_unprotect_end(funchook_t *funchook, const mem_state_t *mstate)
++{
++    /* Pages of the pool stay writable (funchook_page_protect). */
++    uint8_t *addr = (uint8_t *)mstate->addr;
++    if (addr + mstate->size > ps4_funchook_pool && addr < ps4_funchook_pool + PS4_POOL_BYTES) {
++        return 0;
++    }
++    int32_t rv = sceKernelMprotect(mstate->addr, mstate->size, PS4_PROT_RX);
++    if (rv != 0) {
++        funchook_set_error_message(funchook, "sceKernelMprotect(%p, 0x%zx, rx) = 0x%x", mstate->addr,
++                                   mstate->size, (unsigned)rv);
++        return FUNCHOOK_ERROR_MEMORY_FUNCTION;
++    }
++    return 0;
++}
++
++/* One statically linked image: a function's address is its code. */
++void *funchook_resolve_func(funchook_t *funchook, void *func)
++{
++    (void)funchook;
++    return func;
++}
+diff --git a/ps4/input.cpp b/ps4/input.cpp
+new file mode 100644
+index 00000000000..1e9bd1c1088
+--- /dev/null
++++ b/ps4/input.cpp
+@@ -0,0 +1,64 @@
++// PS4 controllers as SDL virtual gamepads: the PS5 port's ps5/input.cpp, over ps4/native/platform.c.
++// aurora calls the ps5_input_* hooks on both consoles (extern/aurora/lib/input.cpp, aurora.cpp).
++#include <SDL3/SDL.h>
++#include "native/platform.h"
++#include <algorithm>
++
++namespace {
++struct Player { int slot; SDL_JoystickID id = 0; SDL_Joystick* joystick = nullptr; };
++Player players[PAD_PLAYERS]{{0},{1},{2},{3}};
++bool rumble(void* data, Uint16 low, Uint16 high) {
++    pad_player_vibrate(static_cast<Player*>(data)->slot, low / 65535.f, high / 65535.f);
++    return true;
++}
++bool led(void* data, Uint8 r, Uint8 g, Uint8 b) {
++    pad_player_light_bar(static_cast<Player*>(data)->slot, r, g, b);
++    return true;
++}
++// SDL's buttons in their physical places (Cross south, Circle east), for a DualShock 4: Dusklight
++// names them Cross, Circle, Square and Triangle. Which is A and which is B is aurora's PS4 mapping
++// (Circle confirms as A, Cross goes back as B, as on Nintendo's pads), so the game and its menus
++// agree; the PlayStation button textures match (tools/make-ps-buttons.py).
++constexpr unsigned buttons[] = {PAD_CROSS, PAD_CIRCLE, PAD_SQUARE, PAD_TRIANGLE,
++    PAD_TOUCH_PAD, 0, PAD_OPTIONS, PAD_L3, PAD_R3, PAD_L1, PAD_R1,
++    PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT};
++Sint16 axis(float value) {
++    return static_cast<Sint16>(std::clamp(value * 32767.f, -32768.f, 32767.f));
++}
++void detach(Player& p) {
++    pad_player_vibrate(p.slot, 0, 0);
++    if (p.joystick) SDL_CloseJoystick(p.joystick);
++    if (p.id) SDL_DetachVirtualJoystick(p.id);
++    p.id = 0; p.joystick = nullptr;
++}
++}
++extern "C" void ps5_input_initialize() { pad_open(); }
++extern "C" void ps5_input_shutdown() { for (auto& p : players) detach(p); }
++extern "C" void ps5_input_poll() {
++    pad first{}; pad_poll(&first);
++    for (auto& p : players) {
++        pad state{};
++        if (!pad_player(p.slot, &state)) { if (p.id) detach(p); continue; }
++        if (!p.id) {
++            SDL_VirtualJoystickDesc desc{}; SDL_INIT_INTERFACE(&desc);
++            desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++            desc.naxes = SDL_GAMEPAD_AXIS_COUNT; desc.nbuttons = 15;
++            desc.axis_mask = (1u << desc.naxes) - 1;
++            desc.button_mask = (1u << desc.nbuttons) - 1;
++            desc.name = "DUALSHOCK 4"; desc.userdata = &p;
++            desc.vendor_id = 0x054c; desc.product_id = 0x09cc;  // Sony DualShock 4 (CUH-ZCT2)
++            desc.Rumble = rumble; desc.SetLED = led;
++            p.id = SDL_AttachVirtualJoystick(&desc);
++            if (!p.id) { say("Controller attach failed: %s", SDL_GetError()); continue; }
++            p.joystick = SDL_OpenJoystick(p.id);
++            if (!p.joystick) { detach(p); continue; }
++            SDL_SetJoystickPlayerIndex(p.joystick, p.slot);
++        }
++        const float axes[] = {state.left_x, state.left_y, state.right_x,
++            state.right_y, state.l2 * 2 - 1, state.r2 * 2 - 1};
++        for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; ++i)
++            SDL_SetJoystickVirtualAxis(p.joystick, i, axis(axes[i]));
++        for (int i = 0; i < 15; ++i)
++            SDL_SetJoystickVirtualButton(p.joystick, i, (state.held & buttons[i]) != 0);
++    }
++}
+diff --git a/ps4/main.cpp b/ps4/main.cpp
+new file mode 100644
+index 00000000000..0f5a6b78e5b
+--- /dev/null
++++ b/ps4/main.cpp
+@@ -0,0 +1,52 @@
++// The PS4 title's entry point, after ps5/main.cpp. /app0 (the installed package) is read-only on
++// the PS4, so the user data, logs and the game's disc image live in /data/dusklight-ps4: copy your
++// own GameCube disc image there as game.iso.
++#include <sys/stat.h>
++
++#include <cstdio>
++#include <filesystem>
++#include <system_error>
++
++#include <SDL3/SDL_stdinc.h>
++
++#include "native/platform.h"
++#include "prof/ps4_profiler.hpp"
++
++extern "C" int aurora_main(int argc, char** argv);
++
++int main() {
++    platform_init("Dusklight");
++#if PS4_DEV_TOOLS
++    // The profiler reports frame statistics to the log (ps4/prof); /data/dusklight-ps4/prof adds its
++    // zones and the sampler, /data/dusklight-ps4/noprof turns it off. The release has no profiler.
++    struct stat noProfiler {};
++    if (stat("/data/dusklight-ps4/noprof", &noProfiler) != 0)
++        ps4prof::start();
++#endif
++    mkdir("/data/dusklight-ps4/user", 0777);
++    mkdir("/data/dusklight-ps4/logs", 0777);
++    mkdir("/data/dusklight-ps4/cache", 0777);
++    // The console preset (ps4/default-config.json: English, no update checks), on the first run only.
++    std::error_code error;
++    if (!std::filesystem::exists("/data/dusklight-ps4/user/config.json", error))
++        std::filesystem::copy_file("/app0/default-config.json", "/data/dusklight-ps4/user/config.json", error);
++
++    SDL_Environment* environment = SDL_GetEnvironment();
++    SDL_SetEnvironmentVariable(environment, "SDL_VIDEODRIVER", "dummy", true);
++    // SDL3's SceAudioOut driver (src/audio/ps5 in the SDL3 fork) serves both consoles.
++    SDL_SetEnvironmentVariable(environment, "SDL_AUDIODRIVER", "ps5", true);
++    SDL_SetEnvironmentVariable(environment, "XDG_DATA_HOME", "/data/dusklight-ps4/user", true);
++
++    char app[] = "/app0/eboot.bin";
++    char user[] = "--user-dir=/data/dusklight-ps4/user";
++    char log[] = "--log-dir=/data/dusklight-ps4/logs";
++    // The game image: inside the package when the Setup Studio built a complete one (/app0/game.iso),
++    // otherwise the one copied to /data (the separate setup).
++    struct stat embedded {};
++    char disc[64];
++    std::snprintf(disc, sizeof(disc), "%s",
++        stat("/app0/game.iso", &embedded) == 0 ? "/app0/game.iso" : "/data/dusklight-ps4/game.iso");
++    char* args[] = {app, user, log, disc, nullptr};
++    const int status = aurora_main(4, args);
++    catchReturnFromMain(status);
++}
+diff --git a/ps4/native/platform.c b/ps4/native/platform.c
+new file mode 100644
+index 00000000000..4c68742c791
+--- /dev/null
++++ b/ps4/native/platform.c
+@@ -0,0 +1,359 @@
++/*
++ * The PS4 console layer for Dusklight: log, splash, pads, time, exit.
++ *
++ * After the PS5 port's ps5/native/platform.c (PS5 Vulkan Template, Copyright (C) 2026 Mihawk,
++ * MIT): the same players and pad readings, with the PS4's pad calls and data, and the system
++ * modules loaded first, as DolphinPS4 loads them.
++ *
++ * This code is licensed under the MIT license (MIT) (http://opensource.org/licenses/MIT)
++ */
++#include "platform.h"
++
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++/* Declared here rather than through the OpenOrbis headers, as DolphinPS4's Mesa layer does. */
++int sceSysmoduleLoadModuleInternal(uint32_t id);
++int sceSystemServiceHideSplashScreen(void);
++int sceSystemServiceLoadExec(const char *path, char *const argv[]);
++int sceUserServiceInitialize(const void *params);
++int sceUserServiceGetInitialUser(int32_t *user_id);
++/* The signed-in users, at most four; unused entries are -1. */
++struct user_list {
++   int32_t user_id[4];
++};
++int sceUserServiceGetLoginUserIdList(struct user_list *list);
++int scePadInit(void);
++int scePadOpen(int32_t user_id, int32_t port_type, int32_t index, const void *params);
++int scePadGetHandle(int32_t user_id, uint32_t port_type, uint32_t index);
++int scePadReadState(int32_t handle, void *data);
++int scePadClose(int32_t handle);
++int scePadSetVibration(int32_t handle, const void *vibration);
++int scePadSetLightBar(int32_t handle, const void *color);
++int sceKernelUsleep(unsigned int microseconds);
++int sceKernelDebugOutText(int channel, const char *text);
++
++#define LOG_DIR "/data/dusklight-ps4"
++
++/* Calling into a system library whose module isn't loaded kills the title
++ * (PRX_NOT_RESOLVED_FUNCTION); DolphinPS4 loads these first. */
++static const struct {
++   const char *name;
++   uint32_t id;
++} system_modules[] = {
++   {"SystemService", 0x80000010},
++   {"UserService", 0x80000011},
++   {"VideoOut", 0x80000022},
++   {"AudioOut", 0x80000001},
++   {"Pad", 0x80000024},
++   /* The C library's resolver (getaddrinfo) imports sceNetGetDnsInfo. */
++   {"Net", 0x8000001c},
++};
++
++void
++platform_init(const char *title_name)
++{
++   mkdir(LOG_DIR, 0777);
++   /* The previous run's log stays as dusklight.prev.log (a restart would otherwise overwrite the
++    * one that showed a problem). freopen(stderr) leaves the file empty on the console; point
++    * descriptor 2 at it instead. */
++   rename(LOG_DIR "/dusklight.log", LOG_DIR "/dusklight.prev.log");
++   const int log = open(LOG_DIR "/dusklight.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++   if (log >= 0) {
++      dup2(log, 2);
++      if (log != 2)
++         close(log);
++   }
++   setvbuf(stderr, NULL, _IONBF, 0);
++   say("%s starts", title_name);
++   for (size_t i = 0; i < sizeof(system_modules) / sizeof(system_modules[0]); i++) {
++      const int result = sceSysmoduleLoadModuleInternal(system_modules[i].id);
++      if (result != 0)
++         say("loading system module %s failed (%#x)", system_modules[i].name, (unsigned)result);
++   }
++   /* The shell's splash (sce_sys/pic1.png) covers the title until ps4_hide_splash: it stays up
++    * through loading, which showed black for the first seconds, until the first frame. */
++}
++
++void
++ps4_hide_splash(void)
++{
++   static volatile int hidden;
++   if (__atomic_exchange_n(&hidden, 1, __ATOMIC_ACQ_REL))
++      return;
++   say("splash dismissed: %d", sceSystemServiceHideSplashScreen());
++}
++
++void
++say(const char *format, ...)
++{
++   char line[1024];
++   va_list args;
++   va_start(args, format);
++   int n = vsnprintf(line, sizeof(line) - 1, format, args);
++   va_end(args);
++   if (n < 0)
++      return;
++   if (n > (int)sizeof(line) - 2)
++      n = sizeof(line) - 2;
++   line[n] = '\n';
++   line[n + 1] = '\0';
++   fputs(line, stderr);
++   fflush(stderr);
++   sceKernelDebugOutText(0, line);
++}
++
++double
++now_seconds(void)
++{
++   struct timespec t;
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
++}
++
++void
++catchReturnFromMain(int status)
++{
++   say("exit status %d: asking the shell to close the title", status);
++   fflush(NULL);
++   (void)sceSystemServiceLoadExec("exit", NULL);
++   for (;;)
++      sceKernelUsleep(100000);
++}
++
++/* ----------------------------------------------------------------- the pad */
++
++/* One reading as the PS4 writes it (OpenOrbis's OrbisPadData): 120 bytes, the
++ * same size and the same places for buttons, sticks, connection and time as
++ * the PS5's samples. */
++struct pad_sample {
++   uint32_t buttons;
++   uint8_t left_x, left_y, right_x, right_y, l2, r2;
++   uint16_t padding;
++   float orientation[4];
++   float velocity[3];
++   float acceleration[3];
++   uint8_t touch[24];
++   uint8_t connected;
++   uint64_t timestamp_us;
++   uint8_t extension[16];
++   uint8_t connected_count;
++   uint8_t reserved[15];
++};
++_Static_assert(sizeof(struct pad_sample) == 120, "the console's pad readings are 120 bytes");
++_Static_assert(offsetof(struct pad_sample, connected) == 0x4c, "connection state sits at 0x4c");
++_Static_assert(offsetof(struct pad_sample, timestamp_us) == 0x50, "the timestamp sits at 0x50");
++
++/* Set in a reading's buttons while the shell has the pad (the home screen, a
++ * system dialog): that reading is not input for the title. */
++#define PAD_INTERCEPTED 0x80000000u
++
++struct pad_player_state {
++   int32_t user;
++   int32_t handle;
++   struct pad_sample last;
++};
++
++static struct pad_player_state pad_states[PAD_PLAYERS];
++static bool pad_service;
++static double pad_next_scan;
++/* A user whose controller would not open, said once rather than every scan. */
++static int32_t pad_unopened = -1;
++#define PAD_SCAN_SECONDS 1.0
++
++static struct pad_player_state *
++pad_state(int player)
++{
++   if (!pad_service || player < 0 || player >= PAD_PLAYERS || pad_states[player].handle < 0)
++      return NULL;
++   return &pad_states[player];
++}
++
++static void
++pad_rest(struct pad_player_state *state)
++{
++   memset(state, 0, sizeof(*state));
++   state->user = state->handle = -1;
++   state->last.left_x = state->last.left_y = state->last.right_x = state->last.right_y = 128;
++}
++
++static bool
++pad_player_open(int player, int32_t user, int attempts)
++{
++   struct pad_player_state *state = &pad_states[player];
++   pad_rest(state);
++   /* A title can start before the pad service has published the device. */
++   int32_t handle = -1;
++   for (int attempt = 0; attempt < attempts && handle < 0; attempt++) {
++      handle = scePadOpen(user, 0, 0, NULL);
++      if (handle < 0 && attempt + 1 < attempts)
++         sceKernelUsleep(100000);
++   }
++   /* A handle this process already holds for the user is reused. */
++   if (handle < 0)
++      handle = scePadGetHandle(user, 0, 0);
++   if (handle < 0) {
++      if (user != pad_unopened)
++         say("pad: scePadOpen failed for user %d (player %d): %#x", (int)user, player, (unsigned)handle);
++      pad_unopened = user;
++      return false;
++   }
++   state->user = user;
++   state->handle = handle;
++   say("pad: player %d opened for user %d", player, (int)user);
++   return true;
++}
++
++static void
++pad_player_close(int player, const char *why)
++{
++   struct pad_player_state *state = &pad_states[player];
++   if (state->handle < 0)
++      return;
++   say("pad: player %d let go (user %d %s), close %d", player, (int)state->user, why, scePadClose(state->handle));
++   pad_rest(state);
++}
++
++/* The signed-in users again: player 0 stays; a player whose user signed out is
++ * let go; a new user's controller takes the first free player. */
++static void
++pad_scan(void)
++{
++   struct user_list list = {{-1, -1, -1, -1}};
++   if (sceUserServiceGetLoginUserIdList(&list) < 0)
++      return;
++   for (int player = 1; player < PAD_PLAYERS; player++) {
++      if (pad_states[player].handle < 0)
++         continue;
++      bool signed_in = false;
++      for (int i = 0; i < 4; i++)
++         signed_in |= list.user_id[i] >= 0 && list.user_id[i] == pad_states[player].user;
++      if (!signed_in)
++         pad_player_close(player, "signed out");
++   }
++   for (int i = 0; i < 4; i++) {
++      const int32_t user = list.user_id[i];
++      bool known = user < 0;
++      for (int player = 0; player < PAD_PLAYERS && !known; player++)
++         known = pad_states[player].handle >= 0 && pad_states[player].user == user;
++      for (int player = 0; player < PAD_PLAYERS && !known; player++) {
++         if (pad_states[player].handle < 0) {
++            (void)pad_player_open(player, user, 1);
++            break;
++         }
++      }
++   }
++}
++
++bool
++pad_open(void)
++{
++   for (int player = 0; player < PAD_PLAYERS; player++)
++      pad_rest(&pad_states[player]);
++   (void)sceUserServiceInitialize(NULL);
++   int32_t user = -1;
++   if (sceUserServiceGetInitialUser(&user) < 0 || scePadInit() < 0) {
++      say("pad: no user or no pad service");
++      return false;
++   }
++   pad_service = true;
++   const bool opened = pad_player_open(0, user, 10);
++   pad_scan();
++   pad_next_scan = now_seconds() + PAD_SCAN_SECONDS;
++   return opened;
++}
++
++static float
++stick(uint8_t value)
++{
++   const float v = ((float)value - 128.0f) / 127.0f;
++   const float dead = 0.12f;
++   if (v > -dead && v < dead)
++      return 0.0f;
++   return v > 0 ? (v - dead) / (1.0f - dead) : (v + dead) / (1.0f - dead);
++}
++
++static void
++pad_fill(const struct pad_player_state *state, struct pad *pad)
++{
++   const uint32_t before = pad->held;
++   pad->held = state->handle >= 0 ? state->last.buttons : 0;
++   pad->pressed = pad->held & ~before;
++   pad->left_x = stick(state->last.left_x);
++   pad->left_y = stick(state->last.left_y);
++   pad->right_x = stick(state->last.right_x);
++   pad->right_y = stick(state->last.right_y);
++   pad->l2 = state->last.l2 / 255.0f;
++   pad->r2 = state->last.r2 / 255.0f;
++}
++
++void
++pad_poll(struct pad *pad)
++{
++   if (pad_service && now_seconds() >= pad_next_scan) {
++      pad_scan();
++      pad_next_scan = now_seconds() + PAD_SCAN_SECONDS;
++   }
++   for (int player = 0; player < PAD_PLAYERS; player++) {
++      struct pad_player_state *state = pad_state(player);
++      if (state == NULL)
++         continue;
++      struct pad_sample sample;
++      memset(&sample, 0, sizeof(sample));
++      if (scePadReadState(state->handle, &sample) < 0 || !sample.connected)
++         continue;
++      /* While the shell has the pad, the title sees it at rest. */
++      if (sample.buttons & PAD_INTERCEPTED) {
++         const int32_t user = state->user, handle = state->handle;
++         pad_rest(state);
++         state->user = user;
++         state->handle = handle;
++         continue;
++      }
++      state->last = sample;
++   }
++   (void)pad_player(0, pad);
++}
++
++bool
++pad_player(int player, struct pad *pad)
++{
++   const struct pad_player_state *state = pad_state(player);
++   if (state == NULL) {
++      struct pad_player_state rest;
++      pad_rest(&rest);
++      pad_fill(&rest, pad);
++      return false;
++   }
++   pad_fill(state, pad);
++   return true;
++}
++
++void
++pad_player_vibrate(int player, float large, float small)
++{
++   const struct pad_player_state *state = pad_state(player);
++   if (state == NULL)
++      return;
++   const uint8_t motors[2] = {
++      (uint8_t)(large <= 0 ? 0 : large >= 1 ? 255 : large * 255.0f),
++      (uint8_t)(small <= 0 ? 0 : small >= 1 ? 255 : small * 255.0f),
++   };
++   scePadSetVibration(state->handle, motors);
++}
++
++void
++pad_player_light_bar(int player, uint8_t r, uint8_t g, uint8_t b)
++{
++   const struct pad_player_state *state = pad_state(player);
++   if (state == NULL)
++      return;
++   const uint8_t color[4] = {r, g, b, 255};
++   scePadSetLightBar(state->handle, color);
++}
+diff --git a/ps4/native/platform.h b/ps4/native/platform.h
+new file mode 100644
+index 00000000000..391a1bfbf81
+--- /dev/null
++++ b/ps4/native/platform.h
+@@ -0,0 +1,83 @@
++/*
++ * The PS4 console layer for Dusklight: log, splash, pads, time, exit.
++ *
++ * The interface of the PS5 port's ps5/native/platform.h (PS5 Vulkan Template, Copyright (C) 2026
++ * Mihawk, MIT), less its audio (SDL3's SceAudioOut driver plays the game's sound), so that
++ * ps4/input.cpp is the PS5 port's input.cpp.
++ *
++ * This code is licensed under the MIT license (MIT) (http://opensource.org/licenses/MIT)
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Standard error to /data/dusklight-ps4/dusklight.log and the system modules the game calls
++ * loaded. Call first. */
++void platform_init(const char *title_name);
++
++/* Dismisses the shell's splash (sce_sys/pic1.png), once: aurora calls it when the first frame is
++ * on screen. */
++void ps4_hide_splash(void);
++
++/* One line to the log and the kernel's debug output, flushed. */
++void say(const char *format, ...) __attribute__((format(printf, 1, 2)));
++
++double now_seconds(void);
++
++/* Asks the shell to close the title and never returns: returning from main or exit() makes the
++ * console report a crash. */
++void catchReturnFromMain(int status);
++
++/* The pad, in the console's button numbering (the same on PS4 and PS5). */
++enum {
++   PAD_L3 = 0x000002,
++   PAD_R3 = 0x000004,
++   PAD_OPTIONS = 0x000008,
++   PAD_UP = 0x000010,
++   PAD_RIGHT = 0x000020,
++   PAD_DOWN = 0x000040,
++   PAD_LEFT = 0x000080,
++   PAD_L1 = 0x000400,
++   PAD_R1 = 0x000800,
++   PAD_TRIANGLE = 0x001000,
++   PAD_CIRCLE = 0x002000,
++   PAD_CROSS = 0x004000,
++   PAD_SQUARE = 0x008000,
++   PAD_TOUCH_PAD = 0x100000,
++};
++
++struct pad {
++   uint32_t held;    /* buttons down now */
++   uint32_t pressed; /* buttons that went down since the last poll */
++   float left_x, left_y, right_x, right_y; /* -1..1, a dead zone removed; y is down-positive */
++   float l2, r2;                           /* 0..1 */
++};
++
++/* Up to four players, one per signed-in user: the console pairs each controller with a user.
++ * Player 0 is the user who started the title; pad_poll reads the signed-in users again about
++ * once a second, a new user's controller takes the first free player, and a player is let go
++ * when their user signs out. */
++#define PAD_PLAYERS 4
++
++/* Open player 0's pad (the first user's), and every other signed-in user's; false when there is
++ * none. */
++bool pad_open(void);
++/* Read every player's controller; *pad is player 0's. Call once a frame. */
++void pad_poll(struct pad *pad);
++/* A player's pad as the last pad_poll read it; false, and a pad at rest, when that player has
++ * none. */
++bool pad_player(int player, struct pad *pad);
++
++/* Rumble: the large and the small motor, 0..1 each; 0, 0 stops it. */
++void pad_player_vibrate(int player, float large, float small);
++/* The light bar's colour. */
++void pad_player_light_bar(int player, uint8_t r, uint8_t g, uint8_t b);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ps4/native/realpath.c b/ps4/native/realpath.c
+new file mode 100644
+index 00000000000..b876236cd84
+--- /dev/null
++++ b/ps4/native/realpath.c
+@@ -0,0 +1,86 @@
++/*
++ * realpath() for the PS4 build (linked with --wrap=realpath, ps4/Platform.cmake).
++ *
++ * OpenOrbis' musl resolves paths through /proc/self/fd, which the console does not have, so its
++ * realpath fails with ENOSYS, and with it std::filesystem::canonical, weakly_canonical, relative
++ * and proximate. The game's paths (/app0, /data) hold no symbolic links: the path is made
++ * absolute and its "." and ".." components are folded, and it must exist, as realpath requires.
++ */
++#include <errno.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++char *__wrap_realpath(const char *restrict path, char *restrict resolved)
++{
++    char out[PATH_MAX];
++    size_t len = 0;
++    const char *p = path;
++    struct stat st;
++
++    if (path == NULL) {
++        errno = EINVAL;
++        return NULL;
++    }
++    if (*path == '\0') {
++        errno = ENOENT;
++        return NULL;
++    }
++    if (*path != '/') {
++        if (getcwd(out, sizeof(out)) == NULL) {
++            out[0] = '\0';  /* no working directory: relative to the root */
++        }
++        len = strlen(out);
++        while (len > 0 && out[len - 1] == '/') {
++            --len;
++        }
++    }
++
++    while (*p != '\0') {
++        const char *end;
++        size_t n;
++
++        while (*p == '/') {
++            ++p;
++        }
++        end = p;
++        while (*end != '\0' && *end != '/') {
++            ++end;
++        }
++        n = (size_t)(end - p);
++        if (n == 0 || (n == 1 && p[0] == '.')) {
++            /* nothing */
++        } else if (n == 2 && p[0] == '.' && p[1] == '.') {
++            while (len > 0 && out[len - 1] != '/') {
++                --len;
++            }
++            if (len > 0) {
++                --len;  /* the separator */
++            }
++        } else {
++            if (len + 1 + n >= sizeof(out)) {
++                errno = ENAMETOOLONG;
++                return NULL;
++            }
++            out[len++] = '/';
++            memcpy(out + len, p, n);
++            len += n;
++        }
++        p = end;
++    }
++    if (len == 0) {
++        out[len++] = '/';
++    }
++    out[len] = '\0';
++
++    if (stat(out, &st) != 0) {
++        return NULL;  /* errno from stat, ENOENT for a missing path */
++    }
++    if (resolved == NULL) {
++        return strdup(out);
++    }
++    memcpy(resolved, out, len + 1);
++    return resolved;
++}
+diff --git a/ps4/pgo.cpp b/ps4/pgo.cpp
+new file mode 100644
+index 00000000000..796bf0b16c1
+--- /dev/null
++++ b/ps4/pgo.cpp
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: MIT
++// The instrumented build of profile-guided optimisation (tools/build-game.sh PGO=generate): the
++// profiler's reporter calls ps4_pgo_dump after 15 s and then every minute, since the console closes a title without
++// running exit handlers. Dumps alternate between two files, so a title closed mid-write still
++// leaves the previous one whole.
++#include <cstdio>
++
++#include <sys/stat.h>
++
++extern "C" {
++int __llvm_profile_write_file(void);
++void __llvm_profile_set_filename(const char* name);
++
++void ps4_pgo_dump(void) {
++    static unsigned s_dumps = 0;
++    if (s_dumps == 0) {
++        mkdir("/data/dusklight-ps4/pgo", 0777);
++    }
++    const char* name = s_dumps % 2 == 0 ? "/data/dusklight-ps4/pgo/dusklight-a.profraw"
++                                        : "/data/dusklight-ps4/pgo/dusklight-b.profraw";
++    // The runtime appends to an existing file (it would hold every earlier dump too).
++    std::remove(name);
++    __llvm_profile_set_filename(name);
++    const int result = __llvm_profile_write_file();
++    ++s_dumps;
++    std::fprintf(stderr, "[pgo] profile %u written to %s (%d)\n", s_dumps, name, result);
++}
++}
+diff --git a/ps4/prof/ps4_profiler.cpp b/ps4/prof/ps4_profiler.cpp
+new file mode 100644
+index 00000000000..d7e1d5b5cb0
+--- /dev/null
++++ b/ps4/prof/ps4_profiler.cpp
+@@ -0,0 +1,567 @@
++// SPDX-License-Identifier: MIT
++// The PS4 profiler's reporter (ps4_profiler.hpp). Once a second it compares every zone site with
++// the previous second; a second with a slow frame (a hitch, a scene load) gets the sites that took
++// the time listed. Every ten seconds a summary follows: frame rate, frame times, how busy the main
++// thread and the process were, and the most expensive sites. Lines go to stderr, the title's log
++// (/data/dusklight-ps4/dusklight.log), prefixed "[prof]".
++#include "ps4_profiler.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <iterator>
++#include <new>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <pthread.h>
++#include <signal.h>
++#include <sys/resource.h>
++#include <sys/stat.h>
++#include <time.h>
++
++extern "C" uint64_t sceKernelGetTscFrequency(void);
++extern "C" char __text_start[];  // the OpenOrbis link.x: the start of .text, ELF address 0
++extern "C" int sceKernelGetCurrentCpu(void);
++// RADV's PS4 winsys (ac_ps4_drm.c): GPU clock ticks the GPU spent on submissions, and the span from
++// the first submission's start to the last's end.
++extern "C" __attribute__((weak)) void ac_ps4_get_gpu_busy(uint64_t* busy_ticks, uint64_t* span_ticks);
++// The memory RADV's buffers and images hold, in garlic (its VRAM heap) and onion memory.
++extern "C" __attribute__((weak)) void ac_ps4_get_memory(uint64_t* garlic_bytes, uint64_t* onion_bytes, uint64_t* buffers);
++#if defined(PS4_PGO_GENERATE)
++// The PGO-instrumented build's profile dump (ps4/pgo.cpp). Only that build has it: create-fself
++// refuses an image with an unresolved (weak) symbol.
++extern "C" void ps4_pgo_dump(void);
++#endif
++
++namespace ps4prof {
++
++std::atomic<bool> g_enabled{false};
++
++namespace {
++
++// Frame statistics, thread CPU time and the scene timeline: on whenever the profiler runs. Zones
++// (g_enabled) and the sampler cost the FIFO thread a fifth of its time and are on only with
++// /data/dusklight-ps4/prof.
++std::atomic<bool> g_stats{false};
++
++std::atomic<Site*> s_sites{nullptr};
++std::atomic<uint64_t> s_lastFrame{0};
++std::atomic<uint64_t> s_frames{0};
++std::atomic<uint64_t> s_frameTicks{0};
++std::atomic<uint64_t> s_frameMax{0};
++std::atomic<uint64_t> s_mainCpuNs{0};    // the main thread's CPU time, sampled at frame marks
++std::atomic<uint32_t> s_mainCpuMask{0};  // cores the main thread was seen on
++double s_tscPerMs = 1.6e6;
++unsigned s_pgoSeconds = 0;
++uint64_t s_startTicks = 0;
++
++constexpr double HitchMs = 50.0;
++std::atomic<uint64_t> s_frames20{0};  // frames over 20 ms this second
++std::atomic<uint64_t> s_frames33{0};  // frames over 33.4 ms (a missed second vblank) this second
++
++// Threads that report their own CPU time (ps4prof_thread_busy): the main thread, aurora's render
++// and FIFO threads, audio, texture and pipeline workers, the display's flip thread.
++struct Sample {
++    uint64_t rip;    // where the thread was
++    uint64_t stack;  // the word at the top of its stack: a leaf function's return address
++    uint64_t ticks;
++};
++constexpr size_t SampleRing = 8192;  // ~8 s at the sampling rate; the reporter drains it each second
++
++struct ThreadRecord {
++    const char* name;
++    std::atomic<uint64_t> cpuNs{0};
++    std::atomic<ThreadRecord*> next{nullptr};
++    uint64_t secondCpu = 0;  // the reporter's: CPU time at the last second and summary
++    uint64_t summaryCpu = 0;
++    // Sampled threads (sampled_thread_id): the thread, its samples (written by its own signal
++    // handler only) and how far the reporter has read them.
++    pthread_t thread{};
++    int sampleId = -1;
++    Sample* samples = nullptr;
++    std::atomic<uint64_t> sampleWrite{0};
++    uint64_t sampleRead = 0;
++};
++std::atomic<ThreadRecord*> s_threads{nullptr};
++thread_local ThreadRecord* t_threadRecord = nullptr;
++thread_local uint64_t t_threadSampled = 0;
++constexpr uint64_t SlowSecondFrames = 52;
++
++// The sampler: SIGPROF to the main, render and FIFO threads about 1000 times a second each. The
++// handler notes where the thread was; the reporter appends the samples to samples.bin, which
++// tools/ps4-samples.py symbolizes - where the time goes inside functions without zones, Dawn and
++// Mesa included. /data/dusklight-ps4/nosample turns it off.
++constexpr int SigProf = 27;          // FreeBSD (and Linux) numbering
++constexpr int SaSiginfo = 0x40;      // FreeBSD values: the musl headers may carry Linux ones
++constexpr int SaRestart = 0x02;
++constexpr int McontextOffset = 0x40; // ps4_crashlog.cpp: measured on hardware
++constexpr int RipIndex = 20, RspIndex = 23;
++bool s_sampling = false;
++FILE* s_sampleFile = nullptr;
++
++int sampled_thread_id(const char* name) {
++    static constexpr const char* Names[] = {"main", "aurora render", "gx fifo"};
++    for (int i = 0; i < int(std::size(Names)); ++i) {
++        if (std::strcmp(name, Names[i]) == 0) {
++            return i;
++        }
++    }
++    return -1;
++}
++uint64_t s_secondsSeen = 0;
++constexpr int SummarySeconds = 10;
++
++void atomic_max(std::atomic<uint64_t>& target, uint64_t value) {
++    uint64_t current = target.load(std::memory_order_relaxed);
++    while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
++    }
++}
++
++uint64_t thread_cpu_ns() {
++    timespec ts{};
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
++        return 0;
++    }
++    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
++}
++
++uint64_t process_cpu_ns() {
++    rusage usage{};
++    if (getrusage(RUSAGE_SELF, &usage) != 0) {
++        return 0;
++    }
++    auto ns = [](const timeval& tv) { return uint64_t(tv.tv_sec) * 1000000000ull + uint64_t(tv.tv_usec) * 1000ull; };
++    return ns(usage.ru_utime) + ns(usage.ru_stime);
++}
++
++double seconds_since_start() { return double(ticks() - s_startTicks) / (s_tscPerMs * 1000.0); }
++
++// "name 95%, ..." for each reporting thread over the window, updating its mark.
++std::string thread_busy_text(double windowMs, bool summary) {
++    std::string text;
++    for (ThreadRecord* t = s_threads.load(std::memory_order_acquire); t != nullptr;
++         t = t->next.load(std::memory_order_acquire)) {
++        const uint64_t cpu = t->cpuNs.load(std::memory_order_relaxed);
++        uint64_t& mark = summary ? t->summaryCpu : t->secondCpu;
++        const double percent = cpu > mark ? double(cpu - mark) / 1e4 / windowMs : 0.0;
++        mark = cpu;
++        if (percent < 1.0) {
++            continue;
++        }
++        char part[64];
++        std::snprintf(part, sizeof(part), "%s%s %.0f%%", text.empty() ? "" : ", ", t->name, percent);
++        text += part;
++    }
++    return text.empty() ? "-" : text;
++}
++
++const char* short_file(const char* file) {
++    const char* slash = std::strrchr(file, '/');
++    return slash != nullptr ? slash + 1 : file;
++}
++
++struct Snapshot {
++    uint64_t calls = 0, total = 0, self = 0, mainSelf = 0;
++};
++
++struct Row {
++    const Site* site;
++    uint64_t calls, total, self, max, mainSelf;
++};
++
++Snapshot snapshot(const Site* site) {
++    return {site->calls.load(std::memory_order_relaxed), site->total.load(std::memory_order_relaxed),
++        site->self.load(std::memory_order_relaxed), site->mainSelf.load(std::memory_order_relaxed)};
++}
++
++void print_rows(std::vector<Row>& rows, size_t limit, double windowMs, uint64_t frames) {
++    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.self > b.self; });
++    for (size_t i = 0; i < rows.size() && i < limit; ++i) {
++        const Row& r = rows[i];
++        const double selfMs = double(r.self) / s_tscPerMs;
++        if (selfMs < windowMs * 0.002) {
++            break;
++        }
++        char label[160];
++        if (r.site->name != nullptr) {
++            std::snprintf(label, sizeof(label), "%s", r.site->name);
++        } else {
++            std::snprintf(label, sizeof(label), "%s (%s:%d)", r.site->function, short_file(r.site->file), r.site->line);
++        }
++        std::fprintf(stderr,
++            "[prof]   %7.1f ms self %7.1f ms total %7" PRIu64 " calls  max %6.1f ms  %5.2f ms/frame  main %5.2f ms/frame  %s\n",
++            selfMs, double(r.total) / s_tscPerMs, r.calls, double(r.max) / s_tscPerMs,
++            frames != 0 ? selfMs / double(frames) : 0.0,
++            frames != 0 ? double(r.mainSelf) / s_tscPerMs / double(frames) : 0.0, label);
++    }
++}
++
++thread_local ThreadRecord* t_sampleRecord = nullptr;
++
++void sample_handler(int, siginfo_t*, void* context) {
++    ThreadRecord* record = t_sampleRecord;
++    if (record == nullptr) {
++        return;
++    }
++    const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<const char*>(context) + McontextOffset);
++    const uint64_t rsp = regs[RspIndex];
++    const uint64_t n = record->sampleWrite.load(std::memory_order_relaxed);
++    Sample& sample = record->samples[n % SampleRing];
++    sample.rip = regs[RipIndex];
++    sample.stack = rsp != 0 ? *reinterpret_cast<const uint64_t*>(rsp) : 0;
++    sample.ticks = ticks();
++    record->sampleWrite.store(n + 1, std::memory_order_release);
++}
++
++void sampler() {
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        for (ThreadRecord* t = s_threads.load(std::memory_order_acquire); t != nullptr;
++             t = t->next.load(std::memory_order_acquire)) {
++            if (t->samples != nullptr) {
++                pthread_kill(t->thread, SigProf);
++            }
++        }
++    }
++}
++
++// Appends the samples taken since the last call: per sample a u32 millisecond since the start,
++// the thread (u32: 0 main, 1 render, 2 FIFO), and the two addresses relative to .text (ELF
++// addresses when they are in the eboot's code).
++void write_samples() {
++    if (s_sampleFile == nullptr) {
++        return;
++    }
++    const uint64_t text = reinterpret_cast<uintptr_t>(__text_start);
++    for (ThreadRecord* t = s_threads.load(std::memory_order_acquire); t != nullptr;
++         t = t->next.load(std::memory_order_acquire)) {
++        if (t->samples == nullptr) {
++            continue;
++        }
++        const uint64_t end = t->sampleWrite.load(std::memory_order_acquire);
++        uint64_t n = std::max(t->sampleRead, end > SampleRing ? end - SampleRing : 0);
++        for (; n < end; ++n) {
++            const Sample& sample = t->samples[n % SampleRing];
++            struct {
++                uint32_t ms, thread;
++                uint64_t rip, stack;
++            } out{uint32_t(double(sample.ticks - s_startTicks) / s_tscPerMs), uint32_t(t->sampleId),
++                sample.rip - text, sample.stack - text};
++            std::fwrite(&out, sizeof(out), 1, s_sampleFile);
++        }
++        t->sampleRead = end;
++    }
++    std::fflush(s_sampleFile);
++}
++
++void reporter() {
++    std::unordered_map<const Site*, Snapshot> second, summary;
++    std::unordered_map<const Site*, uint64_t> summaryMax;
++    uint64_t summaryFrames = 0, summaryFrameTicks = 0, summaryFrameMax = 0, summaryHitches = 0;
++    uint64_t summaryMainCpu = s_mainCpuNs.load(), summaryProcessCpu = process_cpu_ns();
++    uint64_t summaryGpuBusy = 0, summaryGpuSpan = 0;
++    uint64_t secondGpuBusy = 0, secondGpuSpan = 0;
++    if (ac_ps4_get_gpu_busy != nullptr) {
++        ac_ps4_get_gpu_busy(&summaryGpuBusy, &summaryGpuSpan);
++    }
++    uint64_t summaryStart = ticks();
++    int secondsInSummary = 0;
++
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::seconds(1));
++        const uint64_t frames = s_frames.exchange(0, std::memory_order_relaxed);
++        const uint64_t frameTicks = s_frameTicks.exchange(0, std::memory_order_relaxed);
++        const uint64_t frameMax = s_frameMax.exchange(0, std::memory_order_relaxed);
++        const double frameMaxMs = double(frameMax) / s_tscPerMs;
++        const bool hitch = frameMaxMs >= HitchMs || frames == 0;
++        const uint64_t frames20 = s_frames20.exchange(0, std::memory_order_relaxed);
++        const uint64_t frames33 = s_frames33.exchange(0, std::memory_order_relaxed);
++        uint64_t gpuBusyNow = 0, gpuSpanNow = 0;
++        if (ac_ps4_get_gpu_busy != nullptr) {
++            ac_ps4_get_gpu_busy(&gpuBusyNow, &gpuSpanNow);
++        }
++        const double gpuSecond = gpuSpanNow > secondGpuSpan
++            ? 100.0 * double(gpuBusyNow - secondGpuBusy) / double(gpuSpanNow - secondGpuSpan) : 0.0;
++        secondGpuBusy = gpuBusyNow;
++        secondGpuSpan = gpuSpanNow;
++        const std::string threads = thread_busy_text(1000.0, false);
++        // A second well below the display's rate without a single long frame: what slowed it down.
++        const bool slow = !hitch && frames < SlowSecondFrames && s_secondsSeen > 10;
++        ++s_secondsSeen;
++
++        std::vector<Row> rows;
++        for (Site* site = s_sites.load(std::memory_order_acquire); site != nullptr;
++             site = site->next.load(std::memory_order_acquire)) {
++            const Snapshot now = snapshot(site);
++            const uint64_t max = site->max.exchange(0, std::memory_order_relaxed);
++            Snapshot& last = second[site];
++            if (now.calls != last.calls) {
++                rows.push_back({site, now.calls - last.calls, now.total - last.total, now.self - last.self, max,
++                    now.mainSelf - last.mainSelf});
++            }
++            last = now;
++            uint64_t& longest = summaryMax[site];
++            longest = std::max(longest, max);
++        }
++
++        summaryFrames += frames;
++        summaryFrameTicks += frameTicks;
++        summaryFrameMax = std::max(summaryFrameMax, frameMax);
++        summaryHitches += hitch ? 1 : 0;
++        if (hitch) {
++            std::fprintf(stderr,
++                "[prof] %9.3f hitch: %" PRIu64 " frames this second (%" PRIu64 " over 20 ms, %" PRIu64
++                " over 33 ms), longest %.1f ms, GPU busy %.0f%%; threads: %s; where the time went:\n",
++                seconds_since_start(), frames, frames20, frames33, frameMaxMs, gpuSecond, threads.c_str());
++            print_rows(rows, 14, 1000.0, frames);
++        } else if (slow) {
++            std::fprintf(stderr,
++                "[prof] %9.3f slow second: %" PRIu64 " frames (%" PRIu64 " over 20 ms, %" PRIu64
++                " over 33 ms), longest %.1f ms, GPU busy %.0f%%; threads: %s; where the time went:\n",
++                seconds_since_start(), frames, frames20, frames33, frameMaxMs, gpuSecond, threads.c_str());
++            print_rows(rows, 12, 1000.0, frames);
++        }
++
++        write_samples();
++#if defined(PS4_PGO_GENERATE)
++        if (++s_pgoSeconds == 15 || s_pgoSeconds % 60 == 0) {
++            ps4_pgo_dump();
++        }
++#endif
++        if (++secondsInSummary < SummarySeconds) {
++            continue;
++        }
++        const uint64_t nowTicks = ticks();
++        const double windowMs = double(nowTicks - summaryStart) / s_tscPerMs;
++        const uint64_t mainCpu = s_mainCpuNs.load(std::memory_order_relaxed);
++        const uint64_t processCpu = process_cpu_ns();
++        uint64_t gpuBusy = 0, gpuSpan = 0;
++        if (ac_ps4_get_gpu_busy != nullptr) {
++            ac_ps4_get_gpu_busy(&gpuBusy, &gpuSpan);
++        }
++        const double gpuPercent = gpuSpan > summaryGpuSpan
++            ? 100.0 * double(gpuBusy - summaryGpuBusy) / double(gpuSpan - summaryGpuSpan) : 0.0;
++        summaryGpuBusy = gpuBusy;
++        summaryGpuSpan = gpuSpan;
++        std::fprintf(stderr,
++            "[prof] %9.3f summary %.1f s: %.1f FPS, frame avg %.2f ms max %.1f ms, %" PRIu64
++            " seconds with hitches; main thread busy %.0f%% (cores seen 0x%02x), process %.2f cores busy, GPU busy %.0f%%\n",
++            seconds_since_start(), windowMs / 1000.0, double(summaryFrames) * 1000.0 / windowMs,
++            summaryFrames != 0 ? double(summaryFrameTicks) / s_tscPerMs / double(summaryFrames) : 0.0,
++            double(summaryFrameMax) / s_tscPerMs, summaryHitches,
++            mainCpu > summaryMainCpu ? double(mainCpu - summaryMainCpu) / 1e4 / windowMs : 0.0,
++            s_mainCpuMask.exchange(0, std::memory_order_relaxed),
++            processCpu > summaryProcessCpu ? double(processCpu - summaryProcessCpu) / 1e6 / windowMs : 0.0,
++            gpuPercent);
++        std::vector<Row> summaryRows;
++        for (Site* site = s_sites.load(std::memory_order_acquire); site != nullptr;
++             site = site->next.load(std::memory_order_acquire)) {
++            const Snapshot now = snapshot(site);
++            Snapshot& last = summary[site];
++            if (now.calls != last.calls) {
++                summaryRows.push_back({site, now.calls - last.calls, now.total - last.total, now.self - last.self,
++                    summaryMax[site], now.mainSelf - last.mainSelf});
++            }
++            last = now;
++        }
++        summaryMax.clear();
++        std::fprintf(stderr, "[prof] %9.3f threads over %.1f s: %s\n", seconds_since_start(), windowMs / 1000.0,
++            thread_busy_text(windowMs, true).c_str());
++        if (ac_ps4_get_memory != nullptr) {
++            uint64_t garlic = 0, onion = 0, buffers = 0;
++            ac_ps4_get_memory(&garlic, &onion, &buffers);
++            std::fprintf(stderr, "[prof] %9.3f GPU memory: %.1f MiB VRAM (garlic), %.1f MiB onion, %" PRIu64 " buffers\n",
++                seconds_since_start(), double(garlic) / 1048576.0, double(onion) / 1048576.0, buffers);
++        }
++        print_rows(summaryRows, 20, windowMs, summaryFrames);
++        summaryFrames = summaryFrameTicks = summaryFrameMax = summaryHitches = 0;
++        summaryMainCpu = mainCpu;
++        summaryProcessCpu = processCpu;
++        summaryStart = nowTicks;
++        secondsInSummary = 0;
++    }
++}
++
++// The core clock: a chain of dependent adds takes one cycle each. The best of three runs of 64M
++// adds (~30-40 ms each), against the TSC. A PS4 Pro runs 1.6 GHz, or 2.1 GHz in Boost Mode.
++double measure_core_mhz() {
++    double best = 0.0;
++    for (int run = 0; run < 3; ++run) {
++        uint64_t value = 0;
++        const uint64_t begin = ticks();
++        for (uint32_t i = 0; i < 1000000; ++i) {
++            __asm__ volatile(".rept 64\n\taddq $1, %0\n\t.endr" : "+r"(value));
++        }
++        const double ms = double(ticks() - begin) / s_tscPerMs;
++        best = std::max(best, 64.0 * 1000000.0 / (ms * 1000.0));
++    }
++    return best;
++}
++
++}  // namespace
++
++void Site::enlist() noexcept {
++    bool expected = false;
++    if (!enlisted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
++        return;
++    }
++    Site* head = s_sites.load(std::memory_order_relaxed);
++    do {
++        next.store(head, std::memory_order_relaxed);
++    } while (!s_sites.compare_exchange_weak(head, this, std::memory_order_release, std::memory_order_relaxed));
++}
++
++void frame_mark() noexcept {
++    if (!g_stats.load(std::memory_order_relaxed)) {
++        return;
++    }
++    t_mainThread = true;
++    const uint64_t now = ticks();
++    const uint64_t previous = s_lastFrame.exchange(now, std::memory_order_relaxed);
++    if (previous == 0) {
++        return;
++    }
++    const uint64_t elapsed = now - previous;
++    const uint64_t frame = s_frames.fetch_add(1, std::memory_order_relaxed);
++    if (double(elapsed) > 20.0 * s_tscPerMs) {
++        s_frames20.fetch_add(1, std::memory_order_relaxed);
++    }
++    if (double(elapsed) > 33.4 * s_tscPerMs) {
++        s_frames33.fetch_add(1, std::memory_order_relaxed);
++    }
++    ps4prof_thread_busy("main");
++    s_frameTicks.fetch_add(elapsed, std::memory_order_relaxed);
++    atomic_max(s_frameMax, elapsed);
++    if (frame % 30 == 0) {
++        if (const uint64_t cpu = thread_cpu_ns(); cpu != 0) {
++            s_mainCpuNs.store(cpu, std::memory_order_relaxed);
++        }
++        const int core = sceKernelGetCurrentCpu();
++        if (core >= 0 && core < 32) {
++            s_mainCpuMask.fetch_or(1u << core, std::memory_order_relaxed);
++        }
++    }
++}
++
++// Zones for code built outside the game (ps4prof_c.h): sites made on first use, scopes kept on a
++// per-thread stack, so they nest with the game's zones.
++namespace {
++constexpr int CZoneDepth = 32;
++alignas(Scope) thread_local unsigned char t_cScopes[CZoneDepth][sizeof(Scope)];
++thread_local int t_cDepth = 0;
++std::mutex s_cSiteLock;
++}  // namespace
++
++extern "C" void* ps4prof_enter(void** site, const char* name) {
++    if (!g_enabled.load(std::memory_order_relaxed) || t_cDepth >= CZoneDepth) {
++        return nullptr;
++    }
++    if (*site == nullptr) {
++        std::lock_guard lock{s_cSiteLock};
++        if (*site == nullptr) {
++            *site = new Site(name, name, "", 0);
++        }
++    }
++    return new (t_cScopes[t_cDepth++]) Scope(*static_cast<Site*>(*site));
++}
++
++extern "C" void ps4prof_leave(void* zone) {
++    if (zone == nullptr) {
++        return;
++    }
++    static_cast<Scope*>(zone)->~Scope();
++    --t_cDepth;
++}
++
++extern "C" void ps4prof_thread_busy(const char* name) {
++    if (!g_stats.load(std::memory_order_relaxed)) {
++        return;
++    }
++    if (t_threadRecord == nullptr) {
++        auto* record = new ThreadRecord{name};
++        record->thread = pthread_self();
++        record->sampleId = sampled_thread_id(name);
++        if (s_sampling && record->sampleId >= 0) {
++            record->samples = new Sample[SampleRing]();
++            t_sampleRecord = record;
++        }
++        ThreadRecord* head = s_threads.load(std::memory_order_relaxed);
++        do {
++            record->next.store(head, std::memory_order_relaxed);
++        } while (!s_threads.compare_exchange_weak(head, record, std::memory_order_release, std::memory_order_relaxed));
++        t_threadRecord = record;
++    }
++    // At most every 2 ms: a clock_gettime per call.
++    const uint64_t now = ticks();
++    if (double(now - t_threadSampled) < 2.0 * s_tscPerMs) {
++        return;
++    }
++    t_threadSampled = now;
++    if (const uint64_t cpu = thread_cpu_ns(); cpu != 0) {
++        t_threadRecord->cpuNs.store(cpu, std::memory_order_relaxed);
++    }
++}
++
++extern "C" void ps4prof_scene_note(const char* text) noexcept {
++    if (g_stats.load(std::memory_order_relaxed)) {
++        std::fprintf(stderr, "[prof] %9.3f scene: %s\n", seconds_since_start(), text);
++    }
++}
++
++extern "C" void ps4prof_scene_mark(const char* step) noexcept {
++    static const char* s_lastStep = nullptr;
++    static uint64_t s_changeStart = 0;
++    if (!g_stats.load(std::memory_order_relaxed) || step == s_lastStep) {
++        return;
++    }
++    const uint64_t now = ticks();
++    if (std::strcmp(step, "scene change") == 0 || s_changeStart == 0) {
++        s_changeStart = now;
++    }
++    s_lastStep = step;
++    std::fprintf(stderr, "[prof] %9.3f scene: %s (+%.0f ms)\n", seconds_since_start(), step,
++        double(now - s_changeStart) / s_tscPerMs);
++}
++
++void start() noexcept {
++    const uint64_t frequency = sceKernelGetTscFrequency();
++    if (frequency != 0) {
++        s_tscPerMs = double(frequency) / 1000.0;
++    }
++    s_startTicks = ticks();
++    struct stat st;
++    const bool zones = stat("/data/dusklight-ps4/prof", &st) == 0;
++    std::fprintf(stderr,
++        "[prof] profiler on (%s): TSC %.0f MHz, core clock ~%.0f MHz, %u hardware threads, main thread on core %d\n",
++        zones ? "zones and sampler: /data/dusklight-ps4/prof" : "frame statistics only", s_tscPerMs / 1000.0,
++        measure_core_mhz(), std::thread::hardware_concurrency(), sceKernelGetCurrentCpu());
++    if (zones && stat("/data/dusklight-ps4/nosample", &st) != 0) {
++        s_sampleFile = std::fopen("/data/dusklight-ps4/samples.bin", "wb");
++    }
++    if (s_sampleFile != nullptr) {
++        std::fwrite("DSMP\1\0\0\0", 8, 1, s_sampleFile);
++        struct sigaction action;
++        std::memset(&action, 0, sizeof(action));
++        void (*handler)(int, siginfo_t*, void*) = sample_handler;
++        std::memcpy(&action, &handler, sizeof(handler));  // the handler union's member names vary
++        action.sa_flags = SaSiginfo | SaRestart;
++        sigemptyset(&action.sa_mask);
++        s_sampling = sigaction(SigProf, &action, nullptr) == 0;
++        std::fprintf(stderr, "[prof] sampler %s: main, render and FIFO threads to samples.bin\n",
++            s_sampling ? "on" : "unavailable");
++    }
++    g_stats.store(true, std::memory_order_relaxed);
++    g_enabled.store(zones, std::memory_order_relaxed);
++    std::thread(reporter).detach();
++    if (s_sampling) {
++        std::thread(sampler).detach();
++    }
++}
++
++}  // namespace ps4prof
+diff --git a/ps4/prof/ps4_profiler.hpp b/ps4/prof/ps4_profiler.hpp
+new file mode 100644
+index 00000000000..1c0d8f95a29
+--- /dev/null
++++ b/ps4/prof/ps4_profiler.hpp
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: MIT
++// A small in-game profiler for the PS4 build: the code's Tracy zones (ZoneScoped, ZoneScopedN)
++// and FrameMark feed it (ps4/prof/tracy/Tracy.hpp), and a reporter thread writes where the time
++// went to the log (ps4/prof/ps4_profiler.cpp). Tracy itself needs a connected viewer.
++//
++// A zone costs two TSC reads and a few atomic adds; while profiling is off it costs a load and a
++// branch.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace ps4prof {
++
++struct Site {
++    const char* name;  // ZoneScopedN's name, or null
++    const char* function;
++    const char* file;
++    int line;
++    std::atomic<uint64_t> calls{0};
++    std::atomic<uint64_t> total{0};  // TSC ticks including nested zones
++    std::atomic<uint64_t> self{0};   // TSC ticks without nested zones
++    std::atomic<uint64_t> max{0};    // longest single call since the reporter last looked
++    std::atomic<uint64_t> mainSelf{0};  // self ticks on the main thread (the one marking frames)
++    std::atomic<Site*> next{nullptr};
++    std::atomic<bool> enlisted{false};
++
++    constexpr Site(const char* name_, const char* function_, const char* file_, int line_) noexcept
++    : name(name_), function(function_), file(file_), line(line_) {}
++    void enlist() noexcept;
++};
++
++extern std::atomic<bool> g_enabled;
++
++inline uint64_t ticks() noexcept { return __builtin_ia32_rdtsc(); }
++
++struct Scope;
++inline thread_local Scope* t_current = nullptr;
++inline thread_local bool t_mainThread = false;
++
++struct Scope {
++    Site* site = nullptr;
++    Scope* parent;
++    uint64_t start;
++    uint64_t nested;
++
++    explicit Scope(Site& s) noexcept {
++        if (!g_enabled.load(std::memory_order_relaxed)) {
++            return;
++        }
++        if (!s.enlisted.load(std::memory_order_acquire)) {
++            s.enlist();
++        }
++        site = &s;
++        parent = t_current;
++        nested = 0;
++        t_current = this;
++        start = ticks();
++    }
++    ~Scope() {
++        if (site == nullptr) {
++            return;
++        }
++        const uint64_t elapsed = ticks() - start;
++        site->calls.fetch_add(1, std::memory_order_relaxed);
++        site->total.fetch_add(elapsed, std::memory_order_relaxed);
++        site->self.fetch_add(elapsed - nested, std::memory_order_relaxed);
++        if (t_mainThread) {
++            site->mainSelf.fetch_add(elapsed - nested, std::memory_order_relaxed);
++        }
++        uint64_t longest = site->max.load(std::memory_order_relaxed);
++        while (elapsed > longest &&
++               !site->max.compare_exchange_weak(longest, elapsed, std::memory_order_relaxed)) {
++        }
++        t_current = parent;
++        if (parent != nullptr) {
++            parent->nested += elapsed;
++        }
++    }
++    Scope(const Scope&) = delete;
++    Scope& operator=(const Scope&) = delete;
++};
++
++// One game frame ended (FrameMark).
++void frame_mark() noexcept;
++// Starts the reporter; profiling is on from then on.
++void start() noexcept;
++// Logs a step of a scene change, with the time since the change was requested ("scene change"
++// starts one); a step repeated as its phase polls is logged once.
++extern "C" void ps4prof_scene_mark(const char* step) noexcept;
++// A line in the scene timeline (stage and room names).
++extern "C" void ps4prof_scene_note(const char* text) noexcept;
++// Called from a thread's loop: its CPU time shows as "name N%" in slow seconds and summaries.
++// Samples at most every 2 ms.
++extern "C" void ps4prof_thread_busy(const char* name);
++
++}  // namespace ps4prof
++
++#define PS4PROF_CAT2(a, b) a##b
++#define PS4PROF_CAT(a, b) PS4PROF_CAT2(a, b)
++#define PS4PROF_ZONE(name)                                                                      \
++    static ::ps4prof::Site PS4PROF_CAT(ps4prof_site_, __LINE__){name, __func__, __FILE__, __LINE__}; \
++    ::ps4prof::Scope PS4PROF_CAT(ps4prof_scope_, __LINE__) { PS4PROF_CAT(ps4prof_site_, __LINE__) }
+diff --git a/ps4/prof/ps4prof_c.h b/ps4/prof/ps4prof_c.h
+new file mode 100644
+index 00000000000..3462639c5ba
+--- /dev/null
++++ b/ps4/prof/ps4prof_c.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: MIT
++ * The PS4 profiler (ps4_profiler.hpp) for code built outside the game, in C or C++: Dawn and Mesa.
++ * A zone:
++ *     static void *site;
++ *     void *zone = ps4prof_enter(&site, "vk: queue submit");
++ *     ...
++ *     ps4prof_leave(zone);
++ * The symbols come from the game (ps4/prof/ps4_profiler.cpp); declare them weak where a library
++ * may be linked without it. */
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++void *ps4prof_enter(void **site, const char *name);
++void ps4prof_leave(void *zone);
++/* Call from a thread's loop (cheap; samples at most every 2 ms): its CPU time is reported as
++ * "name N%" per slow second and summary. */
++void ps4prof_thread_busy(const char *name);
++/* A line in the scene timeline (stage names and the like). */
++void ps4prof_scene_note(const char *text);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ps4/prof/tracy/Tracy.hpp b/ps4/prof/tracy/Tracy.hpp
+new file mode 100644
+index 00000000000..c17d04b6634
+--- /dev/null
++++ b/ps4/prof/tracy/Tracy.hpp
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: MIT
++// Tracy's header with its zone and frame macros routed to the PS4 profiler (ps4_profiler.hpp).
++// ps4/Platform.cmake puts this directory ahead of Tracy's own include directory.
++#pragma once
++
++#include_next <tracy/Tracy.hpp>
++
++#if defined(PS4_PROFILER) && !defined(TRACY_ENABLE)
++#include "../ps4_profiler.hpp"
++
++#undef ZoneScoped
++#undef ZoneScopedN
++#undef ZoneScopedS
++#undef ZoneScopedC
++#undef ZoneScopedNS
++#undef ZoneScopedNC
++#undef FrameMark
++#define ZoneScoped PS4PROF_ZONE(nullptr)
++#define ZoneScopedN(name) PS4PROF_ZONE(name)
++#define ZoneScopedS(depth) PS4PROF_ZONE(nullptr)
++#define ZoneScopedC(color) PS4PROF_ZONE(nullptr)
++#define ZoneScopedNS(name, depth) PS4PROF_ZONE(name)
++#define ZoneScopedNC(name, color) PS4PROF_ZONE(name)
++#define FrameMark ::ps4prof::frame_mark()
++// A thread's CPU time in the profiler's reports; code built for other platforms tests for it.
++#define PS4ProfThreadBusy(name) ::ps4prof::ps4prof_thread_busy(name)
++#define PS4ProfSceneNote(text) ::ps4prof::ps4prof_scene_note(text)
++#endif
+diff --git a/ps4/static_mods.cpp b/ps4/static_mods.cpp
+new file mode 100644
+index 00000000000..f56c95a7808
+--- /dev/null
++++ b/ps4/static_mods.cpp
+@@ -0,0 +1,47 @@
++// Code mods linked into the PS4 build (ps4/Platform.cmake compiles each with its five exports
++// renamed, so several can coexist), looked up by the key their package's mod.so holds.
++#include <cstring>
++
++#include <mods/api.h>
++
++#include "dusk/mods/loader/static_module.hpp"
++
++#if defined(PS4_MOD_TWILIGHT_HD)
++extern "C" {
++extern const ModMeta twilight_hd_hud_mod_meta;
++extern ModContext* twilight_hd_hud_mod_ctx;
++ModResult twilight_hd_hud_mod_initialize(ModError* out_error);
++ModResult twilight_hd_hud_mod_update(ModError* out_error);
++ModResult twilight_hd_hud_mod_shutdown(ModError* out_error);
++}
++#endif
++
++namespace dusk::mods::loader {
++namespace {
++#if defined(PS4_MOD_TWILIGHT_HD)
++const StaticModuleSymbol kTwilightHd[] = {
++    {"mod_meta", const_cast<ModMeta*>(&twilight_hd_hud_mod_meta)},
++    {"mod_ctx", &twilight_hd_hud_mod_ctx},
++    {"mod_initialize", reinterpret_cast<void*>(&twilight_hd_hud_mod_initialize)},
++    {"mod_update", reinterpret_cast<void*>(&twilight_hd_hud_mod_update)},
++    {"mod_shutdown", reinterpret_cast<void*>(&twilight_hd_hud_mod_shutdown)},
++};
++#endif
++
++const StaticModule kModules[] = {
++#if defined(PS4_MOD_TWILIGHT_HD)
++    {"twilight_hd_hud", kTwilightHd, sizeof(kTwilightHd) / sizeof(kTwilightHd[0])},
++#endif
++    {nullptr, nullptr, 0},
++};
++}  // namespace
++
++const StaticModule* find_static_module(const char* key) noexcept {
++    for (const auto& module : kModules) {
++        if (module.key != nullptr && key != nullptr && std::strcmp(module.key, key) == 0) {
++            return &module;
++        }
++    }
++    return nullptr;
++}
++}  // namespace dusk::mods::loader
+diff --git a/ps4/symdb_storage.cpp.in b/ps4/symdb_storage.cpp.in
+new file mode 100644
+index 00000000000..3f9dc914f1a
+--- /dev/null
++++ b/ps4/symdb_storage.cpp.in
+@@ -0,0 +1,4 @@
++// Reserved, file-backed space for the symbol manifest (ps4/tools/embed-manifest.py writes it after
++// linking and points src/dusk/mods/manifest.cpp's descriptor at it).
++extern "C" __attribute__((section("ps4_symdb"), used, aligned(16)))
++const unsigned char ps4_symdb_storage[@PS4_SYMDB_BYTES@] = {1};
+diff --git a/ps4/tools/embed-manifest.py b/ps4/tools/embed-manifest.py
+new file mode 100644
+index 00000000000..4c674d192a6
+--- /dev/null
++++ b/ps4/tools/embed-manifest.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Write Dusklight's symbol manifest into the linked PS4 image, without adding sections.
++
++`symgen manifest --embed` appends a section, which the console's loader does not take; the PS4
++build reserves file-backed space instead (ps4_symdb_storage, ps4/symdb_storage.cpp.in). symgen
++needs a GNU build id, which the PS4 link does not make, so it reads a copy carrying one; the image
++itself takes the manifest's build id at run time (src/dusk/mods/manifest.cpp).
++
++    embed-manifest.py --symgen <symgen> --elf <linked image>
++"""
++import argparse
++import hashlib
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++DESCRIPTOR = '_ZN4dusk4mods8manifest12_GLOBAL__N_117s_symdbDescriptorE'
++STORAGE = 'ps4_symdb_storage'
++DESCRIPTOR_MAGIC = 0x52444842444d5953  # "SYMDBHDR"
++
++
++def symbols(elf):
++    out = subprocess.run(['llvm-nm-21', '--defined-only', '-S', str(elf)], check=True,
++                         capture_output=True, text=True).stdout
++    found = {}
++    for line in out.splitlines():
++        parts = line.split()
++        if len(parts) == 4 and parts[3] in (DESCRIPTOR, STORAGE):
++            found[parts[3]] = (int(parts[0], 16), int(parts[1], 16))
++    missing = {DESCRIPTOR, STORAGE} - found.keys()
++    if missing:
++        sys.exit(f'embed-manifest: {elf} lacks {", ".join(sorted(missing))}')
++    return found
++
++
++def file_offset(elf, vaddr, size):
++    out = subprocess.run(['llvm-readelf-21', '-lW', str(elf)], check=True,
++                         capture_output=True, text=True).stdout
++    for line in out.splitlines():
++        parts = line.split()
++        if parts and parts[0] == 'LOAD':
++            offset, start, filesz = int(parts[1], 16), int(parts[2], 16), int(parts[4], 16)
++            if start <= vaddr and vaddr + size <= start + filesz:
++                return offset + (vaddr - start)
++    sys.exit(f'embed-manifest: {vaddr:#x}+{size:#x} is not file-backed in a loaded segment')
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument('--symgen', type=Path, required=True)
++    parser.add_argument('--elf', type=Path, required=True)
++    args = parser.parse_args()
++
++    found = symbols(args.elf)
++    descriptor_vaddr, descriptor_size = found[DESCRIPTOR]
++    storage_vaddr, storage_size = found[STORAGE]
++    descriptor_offset = file_offset(args.elf, descriptor_vaddr, descriptor_size)
++    storage_offset = file_offset(args.elf, storage_vaddr, storage_size)
++
++    image = bytearray(args.elf.read_bytes())
++    magic = struct.unpack_from('<Q', image, descriptor_offset)[0]
++    if magic != DESCRIPTOR_MAGIC:
++        sys.exit(f'embed-manifest: no descriptor at {descriptor_offset:#x} (found {magic:#x})')
++
++    with tempfile.TemporaryDirectory() as temporary:
++        temp = Path(temporary)
++        build_id = hashlib.sha1(image).digest()
++        note = temp / 'build-id.note'
++        note.write_bytes(struct.pack('<III', 4, len(build_id), 3) + b'GNU\0' + build_id)
++        copy = temp / 'image-with-build-id'
++        subprocess.run(['llvm-objcopy-21', '--add-section', f'.note.gnu.build-id={note}',
++                        str(args.elf), str(copy)], check=True)
++        manifest = temp / 'manifest.bin'
++        subprocess.run([str(args.symgen), '--no-color', '-L', 'warn', 'manifest', '--binary', str(copy),
++                        '-o', str(manifest)], check=True)
++        data = manifest.read_bytes()
++
++    if len(data) > storage_size:
++        sys.exit(f'embed-manifest: the manifest is {len(data)} bytes; raise PS4_SYMDB_BYTES '
++                 f'above {storage_size}')
++    image[storage_offset:storage_offset + storage_size] = data + bytes(storage_size - len(data))
++    struct.pack_into('<QQQ', image, descriptor_offset, DESCRIPTOR_MAGIC, storage_vaddr, len(data))
++    args.elf.write_bytes(image)
++    print(f'embed-manifest: {len(data)} bytes ({len(data) * 100 // storage_size}% of the reserved '
++          f'{storage_size}) at {storage_vaddr:#x}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/ps4/tpak.cpp b/ps4/tpak.cpp
+new file mode 100644
+index 00000000000..bf0ff115b51
+--- /dev/null
++++ b/ps4/tpak.cpp
+@@ -0,0 +1,217 @@
++// SPDX-License-Identifier: MIT
++// Texture replacement packs for the PS4 build: <texture_replacements>/<name>.tpak, written by
++// tools/make-tpak.py from a replacement folder. A pack's files are registered with Aurora as
++// virtual replacements and read through a cache of 2 MiB blocks, so the textures of an area, which
++// the pack keeps together, come in with few seeks of the console's hard drive. One file per pack
++// also spares the registration a scan of thousands of files.
++#include "tpak.hpp"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <list>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <aurora/texture.hpp>
++#include <tracy/Tracy.hpp>
++
++extern "C" {
++size_t sceKernelGetDirectMemorySize(void);
++int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t* phys);
++int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align);
++}
++
++namespace ps4::tpak {
++namespace {
++
++constexpr char Magic[8] = {'D', 'T', 'P', 'A', 'K', 0, 1, 0};
++constexpr uint64_t BlockSize = 2u << 20;
++constexpr size_t Blocks = 128;  // 256 MiB: Castle Town and the fields around it stay cached
++
++class Pack {
++public:
++    ~Pack() {
++        if (m_fd >= 0) close(m_fd);
++    }
++
++    bool open(const std::filesystem::path& path) {
++        m_fd = ::open(path.c_str(), O_RDONLY);
++        if (m_fd < 0) return false;
++        uint8_t header[64];
++        if (pread(m_fd, header, sizeof(header), 0) != ssize_t(sizeof(header)) ||
++            std::memcmp(header, Magic, sizeof(Magic)) != 0)
++            return false;
++        uint32_t count;
++        uint64_t indexOffset, indexSize;
++        std::memcpy(&count, header + 8, 4);
++        std::memcpy(&indexOffset, header + 16, 8);
++        std::memcpy(&indexSize, header + 24, 8);
++        m_size = uint64_t(lseek(m_fd, 0, SEEK_END));
++        if (indexSize > (64u << 20) || indexOffset > m_size || indexSize > m_size - indexOffset) return false;
++        std::vector<uint8_t> index(indexSize);
++        if (pread(m_fd, index.data(), index.size(), off_t(indexOffset)) != ssize_t(index.size())) return false;
++        for (size_t pos = 0; pos + 18 <= index.size() && m_order.size() < count;) {
++            uint64_t offset, size;
++            uint16_t length;
++            std::memcpy(&offset, &index[pos], 8);
++            std::memcpy(&size, &index[pos + 8], 8);
++            std::memcpy(&length, &index[pos + 16], 2);
++            pos += 18;
++            if (pos + length > index.size() || offset > m_size || size > m_size - offset) return false;
++            std::string name(reinterpret_cast<const char*>(&index[pos]), length);
++            pos += length;
++            m_entries.emplace(name, Entry{offset, size});
++            m_order.push_back(std::move(name));
++        }
++        return m_order.size() == count;
++    }
++
++    const std::vector<std::string>& files() const { return m_order; }
++
++    bool read(const char* path, std::vector<uint8_t>& out) {
++        const auto it = m_entries.find(path);
++        if (it == m_entries.end()) return false;  // e.g. a mip sidecar the pack does not have
++        out.resize(it->second.size);
++        return copy(it->second.offset, out.data(), out.size());
++    }
++
++private:
++    struct Entry {
++        uint64_t offset, size;
++    };
++    struct Slot {
++        uint64_t index = UINT64_MAX;
++        std::list<size_t>::iterator recent;
++    };
++
++    int m_fd = -1;
++    uint64_t m_size = 0;
++    std::unordered_map<std::string, Entry> m_entries;
++    std::vector<std::string> m_order;
++    std::mutex m_lock;
++    uint8_t* m_arena = nullptr;
++    std::vector<Slot> m_slots;
++    std::list<size_t> m_recent;  // most recently used first
++    std::unordered_map<uint64_t, size_t> m_cached;
++
++    bool allocate() {
++        off_t phys = 0;
++        void* base = nullptr;
++        const size_t bytes = Blocks * BlockSize;
++        if (sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()), bytes, 2u << 20, 0, &phys) == 0 &&
++            sceKernelMapDirectMemory(&base, bytes, 0x3 /* CPU read/write */, 0, phys, 2u << 20) == 0) {
++            m_arena = static_cast<uint8_t*>(base);
++        } else {
++            return false;
++        }
++        m_slots.resize(Blocks);
++        for (size_t i = 0; i < Blocks; ++i) {
++            m_recent.push_back(i);
++            m_slots[i].recent = std::prev(m_recent.end());
++        }
++        return true;
++    }
++
++    const uint8_t* block(uint64_t index) {
++        if (const auto it = m_cached.find(index); it != m_cached.end()) {
++            m_recent.splice(m_recent.begin(), m_recent, m_slots[it->second].recent);
++            return m_arena + it->second * BlockSize;
++        }
++        const size_t number = m_recent.back();
++        Slot& slot = m_slots[number];
++        if (slot.index != UINT64_MAX) m_cached.erase(slot.index);
++        slot.index = UINT64_MAX;
++        uint8_t* data = m_arena + number * BlockSize;
++        const uint64_t start = index * BlockSize;
++        const size_t length = size_t(std::min<uint64_t>(BlockSize, m_size - start));
++        {
++            ZoneScopedN("tex: read 2 MiB of a texture pack");
++            for (size_t done = 0; done < length;) {
++                const ssize_t n = pread(m_fd, data + done, length - done, off_t(start + done));
++                if (n <= 0) return nullptr;
++                done += size_t(n);
++            }
++        }
++        slot.index = index;
++        m_cached[index] = number;
++        m_recent.splice(m_recent.begin(), m_recent, slot.recent);
++        return data;
++    }
++
++    bool copy(uint64_t offset, uint8_t* out, size_t length) {
++        std::lock_guard guard(m_lock);
++        if (m_arena == nullptr && !allocate()) {
++            // No direct memory: read the file directly.
++            return pread(m_fd, out, length, off_t(offset)) == ssize_t(length);
++        }
++        while (length) {
++            const uint8_t* data = block(offset / BlockSize);
++            if (data == nullptr) return false;
++            const size_t within = size_t(offset % BlockSize);
++            const size_t n = std::min<size_t>(length, size_t(std::min<uint64_t>(BlockSize, m_size - offset / BlockSize * BlockSize)) - within);
++            std::memcpy(out, data + within, n);
++            offset += n; out += n; length -= n;
++        }
++        return true;
++    }
++};
++
++std::vector<std::unique_ptr<Pack>> s_packs;
++
++bool read_from_pack(void* userData, const char* path, std::vector<uint8_t>& outBytes) {
++    return static_cast<Pack*>(userData)->read(path, outBytes);
++}
++
++bool is_sidecar_mip(const std::string& name) {
++    const size_t dot = name.rfind('.');
++    size_t end = dot == std::string::npos ? name.size() : dot, digits = end;
++    while (digits > 0 && name[digits - 1] >= '0' && name[digits - 1] <= '9') --digits;
++    return digits < end && digits >= 4 && name.compare(digits - 4, 4, "_mip") == 0;
++}
++
++}  // namespace
++
++void close_packs() { s_packs.clear(); }
++
++std::vector<std::filesystem::path> register_packs(const std::filesystem::path& root, int32_t priority,
++    aurora::texture::ReplacementGroup& group) {
++    std::vector<std::filesystem::path> covered;
++    std::error_code error;
++    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
++        if (!entry.is_regular_file(error) || entry.path().extension() != ".tpak") continue;
++        auto pack = std::make_unique<Pack>();
++        if (!pack->open(entry.path())) {
++            std::fprintf(stderr, "[tpak] %s: not a texture pack\n", entry.path().c_str());
++            continue;
++        }
++        size_t registered = 0;
++        std::unordered_set<std::string> names;
++        for (const auto& file : pack->files()) {
++            const std::string name = file.substr(file.rfind('/') + 1);
++            std::string lower = name;
++            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
++            if (is_sidecar_mip(name) || !names.insert(lower).second) continue;
++            const auto registration = aurora::texture::register_virtual_replacement(
++                file, {.read = read_from_pack, .userData = pack.get()}, {.priority = priority});
++            if (registration.id != 0) {
++                group.registrations.push_back(registration);
++                ++registered;
++            }
++        }
++        std::fprintf(stderr, "[tpak] %s: %zu textures registered from %zu files\n", entry.path().c_str(), registered,
++            pack->files().size());
++        covered.push_back(root / entry.path().stem());
++        s_packs.push_back(std::move(pack));
++    }
++    return covered;
++}
++
++}  // namespace ps4::tpak
+diff --git a/ps4/tpak.hpp b/ps4/tpak.hpp
+new file mode 100644
+index 00000000000..849773c6a13
+--- /dev/null
++++ b/ps4/tpak.hpp
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: MIT
++// Texture replacement packs (.tpak) for the PS4 build: ps4/tpak.cpp, tools/make-tpak.py.
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <vector>
++
++#include <aurora/texture.hpp>
++
++namespace ps4::tpak {
++
++// Registers the replacements of every <root>/*.tpak into `group`; returns the folders the packs
++// stand for (<root>/<pack name>), which need no scan.
++std::vector<std::filesystem::path> register_packs(const std::filesystem::path& root, int32_t priority,
++    aurora::texture::ReplacementGroup& group);
++// Closes the packs; their registrations must be gone.
++void close_packs();
++
++}  // namespace ps4::tpak
+diff --git a/src/d/d_menu_ring.cpp b/src/d/d_menu_ring.cpp
+index 6adb3945afb..d8c84d0bdd4 100644
+--- a/src/d/d_menu_ring.cpp
++++ b/src/d/d_menu_ring.cpp
+@@ -507,10 +507,14 @@ dMenu_Ring_c::dMenu_Ring_c(JKRExpHeap* i_heap, STControl* i_stick, CSTControl* i
+         textBox[1] = (J2DTextBox*)mpCenterScreen->search(MULTI_CHAR('fitem_n2'));
+         textBox[2] = (J2DTextBox*)mpCenterScreen->search(MULTI_CHAR('fitem_n3'));
+         textBox[3] = (J2DTextBox*)mpCenterScreen->search(MULTI_CHAR('fitem_n4'));
+-        mpCenterScreen->search(MULTI_CHAR('item_n04'));
+-        mpCenterScreen->search(MULTI_CHAR('item_n05'));
+-        mpCenterScreen->search(MULTI_CHAR('item_n06'));
+-        mpCenterScreen->search(MULTI_CHAR('item_n07'));
++        // The unused Japanese name boxes keep the layout's placeholder text (a French item name
++        // on PAL discs, which mods drawing the name elsewhere picked up): empty them.
++        for (const u64 tag : {MULTI_CHAR('item_n04'), MULTI_CHAR('item_n05'), MULTI_CHAR('item_n06'),
++                              MULTI_CHAR('item_n07')}) {
++            if (J2DTextBox* unused = (J2DTextBox*)mpCenterScreen->search(tag)) {
++                unused->setString(0x40, "");
++            }
++        }
+     }
+ #elif VERSION == VERSION_GCN_JPN
+     textBox[0] = (J2DTextBox*)mpCenterScreen->search(MULTI_CHAR('item_n04'));
+diff --git a/src/d/d_pane_class.cpp b/src/d/d_pane_class.cpp
+index f8338578731..5139e872a17 100644
+--- a/src/d/d_pane_class.cpp
++++ b/src/d/d_pane_class.cpp
+@@ -463,12 +463,19 @@ JGeometry::TBox2<f32>* CPaneMgr::getBounds(J2DPane* p_pane) {
+     
+     J2DPane* parent = p_pane->getParentPane();
+     if (parent != NULL) {
++#if TARGET_PC
++        // The original computes the parent's bounds twice, once for each coordinate: twice per
++        // level, so 2^depth calls for a pane `depth` levels down. Once gives the same result.
++        const JGeometry::TBox2<f32>* parentBounds = getBounds(parent);
++        bounds.addPos(JGeometry::TVec2<f32>(parentBounds->i.x, parentBounds->i.y));
++#else
+         JGeometry::TBox2<f32>* parentBounds = getBounds(parent);
+         f32 y = parentBounds->i.y;
+ 
+         JGeometry::TBox2<f32>* parentBounds2 = getBounds(parent);
+ 
+         bounds.addPos(JGeometry::TVec2<f32>(parentBounds2->i.x, y));
++#endif
+     }
+ 
+     f32 transX = -p_pane->getTranslateX();
+diff --git a/src/d/d_s_play.cpp b/src/d/d_s_play.cpp
+index ab342d66542..144619b83e4 100644
+--- a/src/d/d_s_play.cpp
++++ b/src/d/d_s_play.cpp
+@@ -62,6 +62,14 @@
+ #include "d/d_cursor_mng.h"
+ #endif
+ 
++#if defined(__ORBIS__)
++#include <cstdio>
++extern "C" void ps4prof_scene_mark(const char* step) noexcept;
++extern "C" void ps4prof_scene_note(const char* text) noexcept;
++#define PS4_SCENE_MARK(step) ps4prof_scene_mark(step)
++#else
++#define PS4_SCENE_MARK(step)
++#endif
+ static int dScnPly_Create(scene_class*);
+ static int dScnPly_Delete(dScnPly_c*);
+ static int dScnPly_IsDelete(dScnPly_c);
+@@ -1097,6 +1105,7 @@ void dScnPly_c::offReset() {
+ }
+ 
+ static int phase_00(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_00");
+     if (!i_this->resetGame()) {
+         return cPhs_INIT_e;
+     }
+@@ -1131,6 +1140,7 @@ static int phase_00(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_01(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_01");
+     mDoAud_setHour(dKy_getdaytime_hour());
+     mDoAud_setMinute(dKy_getdaytime_minute());
+     mDoAud_setWeekday(dKy_get_dayofweek());
+@@ -1155,13 +1165,24 @@ static int phase_01(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_0(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_0");
+     return cPhs_NEXT_e;
+ }
+ 
+ static int phase_1(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_1");
+     dStage_roomControl_c::setProcID(fopScnM_GetID(i_this));
+ 
+     dComIfGp_setStartStage(dComIfGp_getNextStartStage());
++#if defined(__ORBIS__)
++    {
++        // Where the profiler's slow seconds happened: the stage being entered.
++        char text[80];
++        snprintf(text, sizeof(text), "stage %s room %d layer %d point %d", dComIfGp_getStartStageName(),
++            dComIfGp_getStartStageRoomNo(), dComIfGp_getStartStageLayer(), dComIfGp_getStartStagePoint());
++        ps4prof_scene_note(text);
++    }
++#endif
+ 
+     if (dComIfGp_getStartStageLayer() < 0 && daPy_py_c::checkRoomRestartStart()) {
+         int layer = dComIfG_play_c::getLayerNo_common_common(dComIfGp_getStartStageName(), dComIfGp_getStartStageRoomNo(), dComIfGp_getStartStageLayer());
+@@ -1368,6 +1389,7 @@ static int phase_1(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_1_0(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_1_0");
+     static char camparamarc[10] = "CamParam";
+ 
+     int rt = dComIfG_syncStageRes("Stg_00");
+@@ -1385,6 +1407,7 @@ static int phase_1_0(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_2(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_2");
+     int rt = dComIfG_syncAllObjectRes();
+     if (rt >= 0 && rt != 0) {
+         return cPhs_INIT_e;
+@@ -1409,6 +1432,7 @@ static int phase_2(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_3(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_3");
+     if ((i_this->sceneCommand != NULL && !i_this->sceneCommand->sync()) || mDoAud_check1stDynamicWave()) {
+         return cPhs_INIT_e;
+     }
+@@ -1433,6 +1457,7 @@ dScnPly_preset_HIO_c g_presetHIO;
+ #endif
+ 
+ static int phase_4(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_4");
+     #if VERSION == VERSION_SHIELD_DEBUG
+     if (!dBgp_c::executeShare()) {
+         return cPhs_INIT_e;
+@@ -1563,6 +1588,7 @@ static int phase_4(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_5(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_5");
+     if (preLoadNo >= 0) {
+         int phase_state = cPhs_NEXT_e;
+         int goodLoads = 0;
+@@ -1598,6 +1624,7 @@ static int phase_5(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_6(dScnPly_c* i_this) {
++    PS4_SCENE_MARK("play scene phase_6");
+     if (preLoadNo >= 0) {
+         int phase_state = cPhs_NEXT_e;
+         int goodLoads = 0;
+@@ -1633,6 +1660,7 @@ static int phase_6(dScnPly_c* i_this) {
+ }
+ 
+ static int phase_compleate(void* i_this) {
++    PS4_SCENE_MARK("play scene complete");
+     return cPhs_COMPLEATE_e;
+ }
+ 
+diff --git a/src/d/d_stage.cpp b/src/d/d_stage.cpp
+index 14167723d92..23356816fbf 100644
+--- a/src/d/d_stage.cpp
++++ b/src/d/d_stage.cpp
+@@ -251,7 +251,19 @@ JKRExpHeap* dStage_roomControl_c::getMemoryBlock(int i_roomNo) {
+     return mMemoryBlock[blockId];
+ }
+ 
++#if defined(__ORBIS__)
++extern "C" void ps4prof_scene_note(const char* text) noexcept;
++#endif
++
+ void dStage_roomControl_c::setStayNo(int i_roomNo) {
++#if defined(__ORBIS__)
++    if (i_roomNo != mStayNo && i_roomNo >= 0) {
++        // Rooms within a stage, for the profiler's timeline.
++        char text[32];
++        snprintf(text, sizeof(text), "room %d", i_roomNo);
++        ps4prof_scene_note(text);
++    }
++#endif
+     mOldStayNo = mStayNo;
+     mStayNo = i_roomNo;
+     mNextStayNo = mStayNo;
+diff --git a/src/dusk/audio/DuskAudioSystem.cpp b/src/dusk/audio/DuskAudioSystem.cpp
+index bdb2acaf65a..390ab680611 100644
+--- a/src/dusk/audio/DuskAudioSystem.cpp
++++ b/src/dusk/audio/DuskAudioSystem.cpp
+@@ -156,6 +156,9 @@ void SDLCALL GetNewAudio(
+     int needed,
+     int) {
+     FrameMarkStart(FrameName);
++#ifdef PS4ProfThreadBusy
++    PS4ProfThreadBusy("audio");
++#endif
+     while (needed > 0) {
+         const int rendered = RenderNewAudioFrame();
+         needed -= rendered;
+diff --git a/src/dusk/logging.cpp b/src/dusk/logging.cpp
+index b85635f1a57..f53a02331a9 100644
+--- a/src/dusk/logging.cpp
++++ b/src/dusk/logging.cpp
+@@ -45,6 +45,17 @@ void dusk::InitializeLogging(
+     options.filePrefix = "dusklight";
+     options.legacyFilePrefixes = {"dusk"};
+     options.divert = &divert_stub_messages;
++#if defined(__ORBIS__)
++    // Every line is written through to the console's hard drive as it comes (the title is closed
++    // without exit handlers), so skip the debug chatter of every resource and scene step, and the
++    // console copy (stdout is the same log file, ps4/native/platform.c).
++#if PS4_DEV_TOOLS
++    options.level = borealis::LogLevel::Info;
++#else
++    options.level = borealis::LogLevel::Warning;  // the release: problems only
++#endif
++    options.console = false;
++#endif
+     standard.apply_to(options);
+     borealis::log::init(options);
+ }
+diff --git a/src/dusk/main.cpp b/src/dusk/main.cpp
+index 26fe61690a1..c5da556a757 100644
+--- a/src/dusk/main.cpp
++++ b/src/dusk/main.cpp
+@@ -33,7 +33,7 @@ int game_main(int argc, char* argv[]);
+ namespace {
+ 
+ bool RestartProcess(int argc, char* argv[]) {
+-#if defined(__PROSPERO__) || defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS) ||                           \
++#if defined(__PROSPERO__) || defined(__ORBIS__) || defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS) ||                           \
+     (defined(TARGET_OS_TV) && TARGET_OS_TV)
+     (void)argc;
+     (void)argv;
+diff --git a/src/dusk/mods/loader/native_module.cpp b/src/dusk/mods/loader/native_module.cpp
+index 0d4eb6a9849..d6ac59b39dd 100644
+--- a/src/dusk/mods/loader/native_module.cpp
++++ b/src/dusk/mods/loader/native_module.cpp
+@@ -28,6 +28,34 @@ std::string pl_dlerror() {
+     }
+     return s;
+ }
++#elif defined(__ORBIS__)
++}  // namespace
++#include <fstream>
++#include <string>
++#include "static_module.hpp"
++namespace {
++// The PS4 cannot load libraries: the game links its code mods, and a package's mod.so holds the
++// key of the linked-in module (dusk::mods::loader::StaticModule).
++std::string s_staticError;
++void* pl_dlopen(const std::filesystem::path& p) {
++    std::ifstream in(p);
++    std::string key;
++    std::getline(in, key);
++    while (!key.empty() && (key.back() == '\r' || key.back() == ' ')) {
++        key.pop_back();
++    }
++    const auto* module = dusk::mods::loader::find_static_module(key.c_str());
++    s_staticError = module ? std::string{} : "no built-in code mod '" + key + "' in this build";
++    return const_cast<dusk::mods::loader::StaticModule*>(module);
++}
++void* pl_dlsym(void* h, const char* name) {
++    return dusk::mods::loader::find_static_symbol(
++        static_cast<const dusk::mods::loader::StaticModule*>(h), name);
++}
++void pl_dlclose(void*) {}
++std::string pl_dlerror() {
++    return s_staticError.empty() ? "(unknown error)" : s_staticError;
++}
+ #else
+ #include <dlfcn.h>
+ void* pl_dlopen(const std::filesystem::path& p) {
+diff --git a/src/dusk/mods/loader/natives.cpp b/src/dusk/mods/loader/natives.cpp
+index 1db66e508b1..529828ba79d 100644
+--- a/src/dusk/mods/loader/natives.cpp
++++ b/src/dusk/mods/loader/natives.cpp
+@@ -56,6 +56,10 @@ static constexpr std::string_view k_nativePlatform = "macos-x86_64"sv;
+ static constexpr std::string_view k_nativePlatform = ""sv;
+ #endif
+ static constexpr std::string_view k_nativeLibName = "mod.so"sv;
++#elif defined(__ORBIS__)
++// Code mods are linked into the PS4 build; mod.so names the built-in module (static_module.hpp).
++static constexpr std::string_view k_nativePlatform = "ps4-x86_64"sv;
++static constexpr std::string_view k_nativeLibName = "mod.so"sv;
+ #elif defined(__linux__)
+ #if defined(__aarch64__)
+ static constexpr std::string_view k_nativePlatform = "linux-aarch64"sv;
+diff --git a/src/dusk/mods/loader/static_module.hpp b/src/dusk/mods/loader/static_module.hpp
+new file mode 100644
+index 00000000000..26916ea0a20
+--- /dev/null
++++ b/src/dusk/mods/loader/static_module.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++// Code mods linked into the game, for platforms that cannot load libraries (the PS4 build,
++// ps4/Platform.cmake). A package's native library file then holds the module's key as text, and
++// NativeModule resolves the module's exports from its table instead of dlopen/dlsym.
++
++namespace dusk::mods::loader {
++
++struct StaticModuleSymbol {
++    const char* name;
++    void* address;
++};
++
++struct StaticModule {
++    const char* key;
++    const StaticModuleSymbol* symbols;
++    unsigned symbolCount;
++};
++
++// Defined by the platform's list of linked-in mods (ps4/static_mods.cpp).
++const StaticModule* find_static_module(const char* key) noexcept;
++
++inline void* find_static_symbol(const StaticModule* module, const char* name) noexcept {
++    if (module == nullptr) {
++        return nullptr;
++    }
++    for (unsigned i = 0; i < module->symbolCount; ++i) {
++        const char* a = module->symbols[i].name;
++        const char* b = name;
++        while (*a != '\0' && *a == *b) {
++            ++a;
++            ++b;
++        }
++        if (*a == *b) {
++            return module->symbols[i].address;
++        }
++    }
++    return nullptr;
++}
++
++}  // namespace dusk::mods::loader
+diff --git a/src/dusk/mods/manifest.cpp b/src/dusk/mods/manifest.cpp
+index e60039a37f7..f33d62965b3 100644
+--- a/src/dusk/mods/manifest.cpp
++++ b/src/dusk/mods/manifest.cpp
+@@ -20,6 +20,8 @@
+ #elif defined(__APPLE__)
+ #include <mach-o/dyld.h>
+ #include <mach-o/loader.h>
++#elif defined(__ORBIS__)
++extern "C" char __text_start[];  // the image's first byte (OpenOrbis link.x), at link address 0
+ #elif defined(__linux__)
+ #include <elf.h>
+ #include <link.h>
+@@ -219,6 +221,17 @@ bool running_image_identity(std::vector<uint8_t>& outId, uintptr_t& outBase) {
+         &ctx);
+     outBase = ctx.base;
+     return ctx.found;
++#elif defined(__ORBIS__)
++    // The PS4 build writes the manifest into this very image after linking (ps4/tools/
++    // embed-manifest.py), so it cannot be stale: the image takes the manifest's own build id.
++    outBase = reinterpret_cast<uintptr_t>(__text_start);
++    if (s_symdbDescriptor.rva == 0 || s_symdbDescriptor.size < sizeof(Header)) {
++        return false;
++    }
++    Header header{};
++    std::memcpy(&header, reinterpret_cast<const void*>(outBase + s_symdbDescriptor.rva), sizeof(header));
++    outId.assign(header.buildId, header.buildId + std::min<size_t>(header.buildIdLen, sizeof(header.buildId)));
++    return true;
+ #else
+     (void)outId;
+     (void)outBase;
+diff --git a/src/dusk/texture_replacements.cpp b/src/dusk/texture_replacements.cpp
+index 118989c6a7e..b1551223b96 100644
+--- a/src/dusk/texture_replacements.cpp
++++ b/src/dusk/texture_replacements.cpp
+@@ -6,6 +6,11 @@
+ #include "dusk/main.h"
+ #include "dusk/settings.h"
+ 
++#if defined(__ORBIS__)
++#include <algorithm>
++#include "../../ps4/tpak.hpp"
++#endif
++
+ namespace dusk::texture_replacements {
+ namespace {
+ aurora::texture::ReplacementGroup s_directoryGroup;
+@@ -14,14 +19,37 @@ aurora::texture::ReplacementGroup s_directoryGroup;
+ void reload() {
+     aurora::texture::unregister_replacements(s_directoryGroup);
+     s_directoryGroup.registrations.clear();
++#if defined(__ORBIS__)
++    ps4::tpak::close_packs();
++#endif
+ 
+     if (!getSettings().game.enableTextureReplacements) {
+         return;
+     }
+ 
+     const auto root = ConfigPath / "texture_replacements";
++#if defined(__ORBIS__)
++    // Packs (ps4/tpak.cpp) first; the folders without one are scanned as usual.
++    const auto covered =
++        ps4::tpak::register_packs(root, kUserTextureReplacementPriority, s_directoryGroup);
++    // Packs inside a complete package (the Setup Studio's), below the user's own: a pack copied to
++    // texture_replacements takes precedence over the built-in one.
++    ps4::tpak::register_packs("/app0/texture_replacements", kUserTextureReplacementPriority - 1, s_directoryGroup);
++    std::error_code error;
++    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
++        if (!entry.is_directory(error) ||
++            std::find(covered.begin(), covered.end(), entry.path()) != covered.end()) {
++            continue;
++        }
++        auto folder = aurora::texture::load_replacement_directory(
++            entry.path(), {.priority = kUserTextureReplacementPriority});
++        s_directoryGroup.registrations.insert(s_directoryGroup.registrations.end(),
++            folder.registrations.begin(), folder.registrations.end());
++    }
++#else
+     s_directoryGroup = aurora::texture::load_replacement_directory(
+         root, {.priority = kUserTextureReplacementPriority});
++#endif
+     DuskLog.info("Texture replacement directory loaded: {} registration(s)",
+                  s_directoryGroup.registrations.size());
+ }
+@@ -29,6 +57,9 @@ void reload() {
+ void shutdown() {
+     aurora::texture::unregister_replacements(s_directoryGroup);
+     s_directoryGroup.registrations.clear();
++#if defined(__ORBIS__)
++    ps4::tpak::close_packs();
++#endif
+ }
+ 
+ }
+diff --git a/src/dusk/ui/icon_provider.cpp b/src/dusk/ui/icon_provider.cpp
+index b8307b92f72..651b8f283f2 100644
+--- a/src/dusk/ui/icon_provider.cpp
++++ b/src/dusk/ui/icon_provider.cpp
+@@ -7,6 +7,7 @@
+ #include <SDL3/SDL_surface.h>
+ #include <aurora/lib/gfx/texture_convert.hpp>
+ #include <aurora/rmlui.hpp>
++#include "dusk/settings.h"
+ #include <fmt/format.h>
+ 
+ #include <algorithm>
+@@ -764,7 +765,9 @@ void unregister_icon_texture_provider() noexcept {
+ 
+ void update_midna_icon_texture(J2DPane* pane) noexcept {
+     auto& state = midna_icon_state();
+-    if (pane == nullptr || !pane->isVisible()) {
++    // Only the touch controls show this icon, and rendering the pane in software is one of the
++    // main thread's largest costs each frame: skip it while they are off.
++    if (pane == nullptr || !pane->isVisible() || !getSettings().game.enableTouchControls) {
+         if (state.valid) {
+             state.valid = false;
+             state.icon = {};
+diff --git a/src/dusk/ui/overlay.cpp b/src/dusk/ui/overlay.cpp
+index 5246a93b10a..794345a56ea 100644
+--- a/src/dusk/ui/overlay.cpp
++++ b/src/dusk/ui/overlay.cpp
+@@ -154,7 +154,11 @@ Rml::String back_button_name() {
+         case SDL_GAMEPAD_TYPE_PS3:
+             return "Select";
+         case SDL_GAMEPAD_TYPE_PS4:
++#if defined(__ORBIS__)
++            return "Touchpad";  // the console keeps Share; the PS4 build's menu is on the touchpad
++#else
+             return "Share";
++#endif
+         case SDL_GAMEPAD_TYPE_PS5:
+             return "Create";
+         case SDL_GAMEPAD_TYPE_XBOX360:
+@@ -274,7 +278,13 @@ void Overlay::update() {
+     }
+ 
+     if (mFpsCounter != nullptr) {
+-        if (getSettings().video.enableFpsOverlay.getValue()) {
++#if defined(__ORBIS__) && !PS4_DEV_TOOLS
++        // The PS4 release shows no frame counter; the developer build follows the setting.
++        constexpr bool fpsOverlay = false;
++#else
++        const bool fpsOverlay = getSettings().video.enableFpsOverlay.getValue();
++#endif
++        if (fpsOverlay) {
+             const int idx = getSettings().video.fpsOverlayCorner.getValue();
+             mFpsCounter->SetAttribute("open", "");
+             mFpsCounter->RemoveProperty(Rml::PropertyId::Bottom);
+diff --git a/src/dusk/ui/ui.cpp b/src/dusk/ui/ui.cpp
+index 85fa4513234..eefdad29750 100644
+--- a/src/dusk/ui/ui.cpp
++++ b/src/dusk/ui/ui.cpp
+@@ -535,7 +535,7 @@ void update() noexcept {
+ }
+ 
+ std::filesystem::path resource_path(const std::filesystem::path& filename) noexcept {
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     return std::filesystem::path("/app0/res") / filename;
+ #else
+     return std::filesystem::path("res") / filename;
+diff --git a/src/f_op/f_op_scene_mng.cpp b/src/f_op/f_op_scene_mng.cpp
+index 6fe54bce57e..238e717070b 100644
+--- a/src/f_op/f_op_scene_mng.cpp
++++ b/src/f_op/f_op_scene_mng.cpp
+@@ -16,7 +16,14 @@ scene_class* fopScnM_SearchByID(fpc_ProcID id) {
+ 
+ static fpc_ProcID l_scnRqID = fpcM_ERROR_PROCESS_ID_e;
+ 
++#if defined(__ORBIS__)
++extern "C" void ps4prof_scene_mark(const char* step) noexcept;
++#endif
++
+ int fopScnM_ChangeReq(scene_class* i_scene, s16 i_procName, s16 param_3, u16 param_4) {
++#if defined(__ORBIS__)
++    ps4prof_scene_mark("scene change");
++#endif
+     fpc_ProcID request_id = fopScnRq_Request(2, i_scene, i_procName, NULL, param_3, param_4);
+     if (request_id == fpcM_ERROR_PROCESS_ID_e) {
+         return 0;
+diff --git a/src/f_pc/f_pc_create_req.cpp b/src/f_pc/f_pc_create_req.cpp
+index e5fdd5ef007..95d3d453676 100644
+--- a/src/f_pc/f_pc_create_req.cpp
++++ b/src/f_pc/f_pc_create_req.cpp
+@@ -14,6 +14,7 @@
+ #include "f_pc/f_pc_debug_sv.h"
+ #include <cstdio>
+ #include "dusk/logging.h"
++#include <tracy/Tracy.hpp>
+ 
+ BOOL fpcCtRq_isCreatingByID(create_tag* i_createTag, fpc_ProcID* i_id) {
+     fpc_ProcID id = ((create_request*)i_createTag->base.mpTagData)->id;
+@@ -121,6 +122,7 @@ BOOL fpcCtRq_Do(create_request* i_request) {
+ }
+ 
+ int fpcCtRq_Handler() {
++    ZoneScopedN("game: create processes");
+ #if DEBUG
+     if (g_fpcDbSv_service[3] != NULL) {
+         g_fpcDbSv_service[3](&g_fpcCtTg_Queue.mSize);
+diff --git a/src/f_pc/f_pc_draw.cpp b/src/f_pc/f_pc_draw.cpp
+index 8c536182191..e30abe06135 100644
+--- a/src/f_pc/f_pc_draw.cpp
++++ b/src/f_pc/f_pc_draw.cpp
+@@ -11,6 +11,7 @@
+ 
+ #if TARGET_PC
+ #include "dusk/logging.h"
++#include <tracy/Tracy.hpp>
+ #endif
+ 
+ int fpcDw_Execute(base_process_class* i_proc) {
+@@ -36,6 +37,7 @@ int fpcDw_Execute(base_process_class* i_proc) {
+ }
+ 
+ int fpcDw_Handler(fpcDw_HandlerFuncFunc i_iterHandler, fpcDw_HandlerFunc i_func) {
++    ZoneScopedN("game: draw processes");
+     static int sDwLogCount = 0;
+     int ret;
+     if (sDwLogCount < 5) { DuskLog.debug("fpcDw_Handler: before BeforeOfDraw"); }
+diff --git a/src/f_pc/f_pc_executor.cpp b/src/f_pc/f_pc_executor.cpp
+index b2a343aab29..8c5c96b83de 100644
+--- a/src/f_pc/f_pc_executor.cpp
++++ b/src/f_pc/f_pc_executor.cpp
+@@ -9,6 +9,7 @@
+ #include "f_pc/f_pc_node.h"
+ #include "f_pc/f_pc_pause.h"
+ #include "f_pc/f_pc_searcher.h"
++#include <tracy/Tracy.hpp>
+ 
+ base_process_class* fpcEx_Search(fpcLyIt_JudgeFunc i_judgeFunc, void* i_data) {
+     return (base_process_class*)fpcLyIt_AllJudge(i_judgeFunc, i_data);
+@@ -83,5 +84,6 @@ int fpcEx_ToExecuteQ(base_process_class* i_proc) {
+ }
+ 
+ void fpcEx_Handler(fpcLnIt_QueueFunc i_queueFunc) {
++    ZoneScopedN("game: execute processes");
+     fpcLnIt_Queue(i_queueFunc);
+ }
+diff --git a/src/f_pc/f_pc_node_req.cpp b/src/f_pc/f_pc_node_req.cpp
+index 32d04055d9b..09613cdc36a 100644
+--- a/src/f_pc/f_pc_node_req.cpp
++++ b/src/f_pc/f_pc_node_req.cpp
+@@ -14,6 +14,7 @@
+ #include "f_pc/f_pc_debug_sv.h"
+ #include <cstdio>
+ #include "dusk/logging.h"
++#include <tracy/Tracy.hpp>
+ 
+ void fpcNdRq_RequestQTo(node_create_request* i_request) {
+     fpcLy_CreatedMesg(i_request->layer);
+@@ -142,6 +143,7 @@ int fpcNdRq_Cancel(node_create_request* i_request) {
+ #define NODE_GET_NEXT(pNode) (pNode ? pNode->mpNextNode : NULL)
+ 
+ int fpcNdRq_Handler() {
++    ZoneScopedN("game: node requests");
+     node_class* node = l_fpcNdRq_Queue.mpHead;
+ 
+     static int sNdRqLogCount = 0;
+diff --git a/src/m_Do/m_Do_dvd_thread.cpp b/src/m_Do/m_Do_dvd_thread.cpp
+index 35f918accf0..010f39e8b34 100644
+--- a/src/m_Do/m_Do_dvd_thread.cpp
++++ b/src/m_Do/m_Do_dvd_thread.cpp
+@@ -15,6 +15,7 @@
+ #include "m_Do/m_Do_controller_pad.h"
+ #include "m_Do/m_Do_ext.h"
+ #include "os_report.h"
++#include <tracy/Tracy.hpp>
+ 
+ s32 mDoDvdThd::main(void* param_0) {
+     JKRThread(OSGetCurrentThread(), 0);
+@@ -160,6 +161,9 @@ static void cb(void* param_0) {
+ void mDoDvdThd_param_c::mainLoop() {
+     mDoDvdThd_command_c* command;
+     while (this->waitForKick() != 0) {
++#ifdef PS4ProfThreadBusy
++        PS4ProfThreadBusy("game dvd");
++#endif
+         while ((command = this->getFirstCommand())) {
+             this->cut(command);
+             if (mDoDvdThd::SyncWidthSound) {
+@@ -240,6 +244,7 @@ mDoDvdThd_mountArchive_c* mDoDvdThd_mountArchive_c::create(char const* pArchiveP
+ }
+ 
+ s32 mDoDvdThd_mountArchive_c::execute() {
++    ZoneScopedN("load: mount archive");
+ #if PLATFORM_GCN
+     bool isZeldaHeap = false;
+     bool isGameHeap = false;
+@@ -325,6 +330,7 @@ static void dummy_mDoDvdThd_mountAramArchive_c__create() {
+ }
+ 
+ s32 mDoDvdThd_mountAramArchive_c::execute() {
++    ZoneScopedN("load: mount ARAM archive");
+     JKRHeap* heap = mDoExt_getArchiveHeap();
+     BOOL result = FALSE;
+     if (!mArchive) {
+@@ -395,6 +401,7 @@ mDoDvdThd_mountXArchive_c* mDoDvdThd_mountXArchive_c::create(char const* pArchiv
+ }
+ 
+ s32 mDoDvdThd_mountXArchive_c::execute() {
++    ZoneScopedN("load: mount X archive");
+ #if DEBUG
+     OSTime time1 = OSGetTime();
+ #endif
+@@ -426,6 +433,7 @@ static void dummy_mDoDvdThd_getResource_c__create() {
+ }
+ 
+ s32 mDoDvdThd_getResource_c::execute() {
++    ZoneScopedN("load: get resource");
+ #if DEBUG
+     OSTime time1 = OSGetTime();
+ #endif
+@@ -481,6 +489,7 @@ mDoDvdThd_toMainRam_c* mDoDvdThd_toMainRam_c::create(char const* pArchivePath, u
+ mDoDvdThd_toMainRam_c::~mDoDvdThd_toMainRam_c() {}
+ 
+ s32 mDoDvdThd_toMainRam_c::execute() {
++    ZoneScopedN("load: file to RAM");
+ #if DEBUG
+     OSTime time1 = OSGetTime();
+ #endif
+diff --git a/src/m_Do/m_Do_graphic.cpp b/src/m_Do/m_Do_graphic.cpp
+index 6bc98b28a77..85aa5fdc9bc 100644
+--- a/src/m_Do/m_Do_graphic.cpp
++++ b/src/m_Do/m_Do_graphic.cpp
+@@ -382,7 +382,14 @@ void mDoGph_gInf_c::resetDimming() {
+ }
+ #endif
+ 
++#if defined(__ORBIS__)
++extern "C" void ps4prof_scene_mark(const char* step) noexcept;
++#endif
++
+ void mDoGph_gInf_c::fadeOut(f32 fadeSpeed, GXColor& fadeColor) {
++#if defined(__ORBIS__)
++    ps4prof_scene_mark(fadeSpeed >= 0.0f ? "screen: fade-out starts" : "screen: fade-in starts");
++#endif
+     mFade = 1;
+     mFadeSpeed = fadeSpeed;
+     mFadeColor = fadeColor;
+diff --git a/src/m_Do/m_Do_main.cpp b/src/m_Do/m_Do_main.cpp
+index b7dc8de2a9c..4ed118fbbf6 100644
+--- a/src/m_Do/m_Do_main.cpp
++++ b/src/m_Do/m_Do_main.cpp
+@@ -537,7 +537,16 @@ static void mods_init(const std::filesystem::path& mods_dir) {
+ #endif
+ 
+     DuskLog.info("Initializing mods...");
++#if defined(__ORBIS__)
++    // A failure here leaves the game playable without mods, and the log says why.
++    try {
++        dusk::mods::ModLoader::instance().init();
++    } catch (const std::exception& e) {
++        DuskLog.error("Mod initialization failed: {}", e.what());
++    }
++#else
+     dusk::mods::ModLoader::instance().init();
++#endif
+ }
+ 
+ // =========================================================================
+@@ -716,6 +725,15 @@ int game_main(int argc, char* argv[]) {
+         config.resourcesPath = "/app0/";
+         config.cachePath = "/app0/user/cache";
+         config.desiredBackend = BACKEND_VULKAN;
++#elif defined(__ORBIS__)
++        // VideoOut's mode (wsi_common_videoout.c in the PS4 Mesa); /app0 is read-only.
++        config.windowWidth = 1920;
++        config.windowHeight = 1080;
++        config.startFullscreen = false;
++        config.pauseOnFocusLost = false;
++        config.resourcesPath = "/app0/";
++        config.cachePath = "/data/dusklight-ps4/cache";
++        config.desiredBackend = BACKEND_VULKAN;
+ #endif
+         auroraInfo = aurora_initialize(argc, argv, &config);
+     }

@@ -1,0 +1,557 @@
+diff --git a/port/mesa/ac_ps4_drm.c b/port/mesa/ac_ps4_drm.c
+index a4589f0..00333fd 100644
+--- a/port/mesa/ac_ps4_drm.c
++++ b/port/mesa/ac_ps4_drm.c
+@@ -102,6 +102,7 @@ struct amdgpu_bo {
+    uint32_t heap;
+    uint64_t flags;
+    off_t pad_phys; /* RADEON_FLAG_VM_PAD_1PAGE page, when it lies past the buffer (else -1) */
++   bool garlic;    /* write-combined garlic memory (RADV's VRAM heap) rather than onion */
+    uint64_t last_va; /* last GPU address mapped at offset 0 (kept after unmap, for reports) */
+    bool tail_mapped;   /* the overflow tail is mapped after the buffer (see PS4_TAIL) */
+    bool tail_reported;
+@@ -153,6 +154,7 @@ struct ac_drm_device {
+ 
+    /* Statistics for the app's monitor (ac_ps4_get_stats). */
+    uint64_t bo_bytes, bo_count;
++   uint64_t bo_bytes_garlic; /* of bo_bytes: in garlic memory (ac_ps4_get_memory) */
+ 
+    /* Handle table. ps4_bo() reads it without the lock (from any thread, e.g. Dolphin's shader
+     * compiler threads), so a full table is copied, never reallocated: old tables stay valid. */
+@@ -175,6 +177,15 @@ struct ac_drm_device {
+    uint32_t *ts_ibs;
+    uint64_t ts_accounted, ts_prev_end, ts_busy, ts_span_first, ts_span_last;
+    uint64_t last_seq; /* last submitted */
++   /* When sceGnmSubmitDone last ran (os_time_get_nano): once per frame, not per submission.
++    * The submission thread's. */
++   int64_t last_submit_done;
++   /* Submissions waiting for the submission thread (ps4_submit_thread), in sequence order. */
++   struct ps4_submit_job *submit_jobs;
++   unsigned submit_head, submit_count;
++   pthread_mutex_t submit_mutex;
++   pthread_cond_t submit_cond;
++   bool submit_thread_started;
+ 
+    /* The last submissions' command buffers, for the GPU hang report. */
+    struct {
+@@ -903,7 +914,15 @@ static struct util_sync_provider *ps4_sync_provider_init(ac_drm_device *dev);
+ static ac_drm_device *ps4_last_device;
+ 
+ /* Logs the first memory operations (bring-up). */
+-static unsigned ps4_verbose_left = 64;
++/* Diagnostics (Dusklight's developer build, the default): IB chain checks and recording before
++ * each submission, buffer tail scans, GPU timestamps for the busy figure, submission statistics,
++ * the first allocations and every 1000th submission in the log. The release defines
++ * PS4_WINSYS_DIAG=0 (tools/build-mesa.sh FLAVOR=final). Errors and hang reports stay. */
++#ifndef PS4_WINSYS_DIAG
++#define PS4_WINSYS_DIAG 1
++#endif
++
++static unsigned ps4_verbose_left = PS4_WINSYS_DIAG ? 64 : 0;
+ #define PS4_VERBOSE(...) do { if (ps4_verbose_left) { ps4_verbose_left--; ps4_log(__VA_ARGS__); } } while (0)
+ 
+ int
+@@ -964,7 +983,8 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
+    {
+       /* Timestamps: [0, 4 KiB) start, [4, 8 KiB) end, then the start IBs (32 bytes each). */
+       STATIC_ASSERT(FENCE_IB_COUNT * 8 * 2 + FENCE_IB_COUNT * TS_IB_DW * 4 <= PS4_PAGE * 2);
+-      uint8_t *ts = ps4_map_new(PS4_PAGE * 2, PS4_WB_ONION, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW, NULL);
++      uint8_t *ts = PS4_WINSYS_DIAG ? ps4_map_new(PS4_PAGE * 2, PS4_WB_ONION, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW, NULL)
++                                    : NULL;
+       if (ts) {
+          memset(ts, 0, PS4_PAGE * 2);
+          dev->ts_start = (volatile uint64_t *)ts;
+@@ -1089,6 +1109,9 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
+    out->abo = bo;
+    __atomic_add_fetch(&dev->bo_bytes, bo->size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&dev->bo_count, 1, __ATOMIC_RELAXED);
++   bo->garlic = type == PS4_WC_GARLIC;
++   if (bo->garlic)
++      __atomic_add_fetch(&dev->bo_bytes_garlic, bo->size, __ATOMIC_RELAXED);
+    PS4_VERBOSE("radv/ps4: bo %u: %llu bytes, heap %#x, flags %#llx, align %#llx, phys %#llx\n",
+                bo->handle, (unsigned long long)bo->size, bo->heap, (unsigned long long)bo->flags,
+                (unsigned long long)align, (unsigned long long)bo->phys);
+@@ -1120,6 +1143,8 @@ ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b)
+    }
+    __atomic_sub_fetch(&dev->bo_bytes, b->size, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&dev->bo_count, 1, __ATOMIC_RELAXED);
++   if (b->garlic)
++      __atomic_sub_fetch(&dev->bo_bytes_garlic, b->size, __ATOMIC_RELAXED);
+    if (b->pad_phys >= 0)
+       sceKernelReleaseDirectMemory(b->pad_phys, PS4_PAGE);
+    ps4_record(dev, 'F', b, b->last_va, b->size);
+@@ -1966,6 +1991,19 @@ ps4_account_gpu_time(ac_drm_device *dev)
+    }
+ }
+ 
++/* The memory RADV's buffers and images hold: in garlic (its VRAM heap) and onion (GTT) memory,
++ * and how many buffers (Dusklight's profiler summaries). */
++void ac_ps4_get_memory(uint64_t *garlic_bytes, uint64_t *onion_bytes, uint64_t *buffers);
++void
++ac_ps4_get_memory(uint64_t *garlic_bytes, uint64_t *onion_bytes, uint64_t *buffers)
++{
++   ac_drm_device *dev = ps4_last_device;
++   const uint64_t total = dev ? __atomic_load_n(&dev->bo_bytes, __ATOMIC_RELAXED) : 0;
++   *garlic_bytes = dev ? __atomic_load_n(&dev->bo_bytes_garlic, __ATOMIC_RELAXED) : 0;
++   *onion_bytes = total > *garlic_bytes ? total - *garlic_bytes : 0;
++   *buffers = dev ? __atomic_load_n(&dev->bo_count, __ATOMIC_RELAXED) : 0;
++}
++
+ void ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks);
+ void
+ ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks)
+@@ -1981,9 +2019,218 @@ ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks)
+    simple_mtx_unlock(&dev->lock);
+ }
+ 
++/* The PS4 profiler (Dusklight's ps4/prof/ps4prof_c.h): the game defines these; anything else
++ * linking Mesa gets these no-ops. */
++void *ps4prof_enter(void **site, const char *name);
++void ps4prof_leave(void *zone);
++
++__attribute__((weak)) void *
++ps4prof_enter(void **site, const char *name)
++{
++   (void)site;
++   (void)name;
++   return NULL;
++}
++
++__attribute__((weak)) void
++ps4prof_leave(void *zone)
++{
++   (void)zone;
++}
++
++void ps4prof_thread_busy(const char *name);
++
++__attribute__((weak)) void
++ps4prof_thread_busy(const char *name)
++{
++   (void)name;
++}
++
++/* Dwords and links of an IB chain, following each IB's trailing chain packet (diagnostics). */
++static void
++ps4_chain_size(const uint32_t *ib, unsigned num_dw, unsigned *links, uint64_t *dwords)
++{
++   for (unsigned link = 0; link < 256 && num_dw; link++) {
++      (*links)++;
++      *dwords += num_dw;
++      const uint32_t *tail = ib + num_dw - 4;
++      if (num_dw < 4 || tail[0] != 0xC0023F00 || !(tail[3] & (1u << 20)))
++         return;
++      ib = (const uint32_t *)(uintptr_t)(tail[1] | ((uint64_t)(tail[2] & 0xffff) << 32));
++      num_dw = tail[3] & 0xfffff;
++   }
++}
++
++/* How long sceGnmSubmitCommandBuffers takes for small and large submissions, logged every 1024
++ * submissions: a fixed cost per call, or one growing with the command stream? */
++static struct {
++   unsigned count[2];
++   uint64_t dwords[2], links[2], ns[2], max_ns[2];
++} ps4_submit_stats;
++
++static void
++ps4_note_submit(uint64_t dwords, unsigned links, int64_t ns)
++{
++   const int big = dwords >= 4096;
++   ps4_submit_stats.count[big]++;
++   ps4_submit_stats.dwords[big] += dwords;
++   ps4_submit_stats.links[big] += links;
++   ps4_submit_stats.ns[big] += ns;
++   if ((uint64_t)ns > ps4_submit_stats.max_ns[big])
++      ps4_submit_stats.max_ns[big] = ns;
++   if (ps4_submit_stats.count[0] + ps4_submit_stats.count[1] < 1024)
++      return;
++   for (int i = 0; i < 2; i++) {
++      const unsigned n = ps4_submit_stats.count[i];
++      if (n)
++         ps4_log("radv/ps4: %s submissions: %u, avg %llu dwords in %.1f IBs, sceGnmSubmitCommandBuffers avg %llu us max %llu us\n",
++                 i ? "large" : "small", n, (unsigned long long)(ps4_submit_stats.dwords[i] / n),
++                 (double)ps4_submit_stats.links[i] / n, (unsigned long long)(ps4_submit_stats.ns[i] / n / 1000),
++                 (unsigned long long)(ps4_submit_stats.max_ns[i] / 1000));
++   }
++   memset(&ps4_submit_stats, 0, sizeof(ps4_submit_stats));
++}
++
++/* ---------------------------------------------------------------------------------------------
++ * The submission thread. sceGnmSubmitCommandBuffers blocks until the GPU has finished the work
++ * submitted before (Dawn's second submission of a frame waited 6-11 ms, the GPU's time for the
++ * frame), so the render thread never recorded a frame while the GPU drew the one before: frame
++ * time = CPU time + GPU time, 40 FPS in Castle Town. Submissions take their sequence number in
++ * order under dev->lock and are queued; this thread hands them to the GPU in that order. */
++
++#define PS4_SUBMIT_QUEUE 64
++
++struct ps4_submit_job {
++   uint64_t seq;
++   uint64_t user_fence_addr;
++   unsigned num_ibs; /* to submit: RADV's, the timestamp IB and the fence IB */
++   unsigned chain_links;
++   uint64_t chain_dwords;
++   void *dcb[64];
++   uint32_t dcb_sizes[64];
++};
++
++/* A submission the system refused: its work is dropped, but its fences must still signal, after
++ * everything before it, or waiters would hang. */
++static void
++ps4_fail_submission(ac_drm_device *dev, const struct ps4_submit_job *job)
++{
++   ps4_wait_seq(dev, job->seq - 1, INT64_MAX);
++   if (job->user_fence_addr)
++      __atomic_store_n((uint64_t *)(uintptr_t)job->user_fence_addr, job->seq, __ATOMIC_RELEASE);
++   __atomic_store_n(dev->fence, job->seq, __ATOMIC_RELEASE);
++}
++
++static void *
++ps4_submit_thread(void *data)
++{
++   ac_drm_device *dev = data;
++   static void *ccb[64];
++   static uint32_t ccb_sizes[64];
++   pthread_mutex_lock(&dev->submit_mutex);
++   for (;;) {
++      while (dev->submit_count == 0)
++         pthread_cond_wait(&dev->submit_cond, &dev->submit_mutex);
++      struct ps4_submit_job *job = &dev->submit_jobs[dev->submit_head];
++      pthread_mutex_unlock(&dev->submit_mutex);
++
++      ps4prof_thread_busy("gnm submit");
++      static void *submit_site;
++      void *submit_zone = ps4prof_enter(&submit_site, "ps4: sceGnmSubmitCommandBuffers (submission thread)");
++#if PS4_WINSYS_DIAG
++      const int64_t start = os_time_get_nano();
++#endif
++      const int r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
++#if PS4_WINSYS_DIAG
++      ps4_note_submit(job->chain_dwords, job->chain_links, os_time_get_nano() - start);
++#endif
++      ps4prof_leave(submit_zone);
++      if (PS4_WINSYS_DIAG && (job->seq <= 40 || job->seq % 1000 == 0))
++         ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
++                 "%llu memory writes checked, %u disabled\n",
++                 (unsigned long long)job->seq, job->num_ibs, job->dcb[0], job->dcb_sizes[0], r,
++                 (unsigned long long)ps4_completed(dev), ps4_writes_checked, ps4_bad_writes);
++      if (r) {
++         ps4_log("radv/ps4: sceGnmSubmitCommandBuffers(%u IBs, submission %llu) = %#x\n", job->num_ibs,
++                 (unsigned long long)job->seq, r);
++         ps4_fail_submission(dev, job);
++      }
++      /* sceGnmSubmitDone tells the system a frame's submissions are complete: once per frame,
++       * and well within its 2 s limit. */
++      const int64_t now = os_time_get_nano();
++      if (now - dev->last_submit_done >= 8000000) {
++         dev->submit_done();
++         dev->last_submit_done = now;
++      }
++
++      pthread_mutex_lock(&dev->submit_mutex);
++      dev->submit_head = (dev->submit_head + 1) % PS4_SUBMIT_QUEUE;
++      dev->submit_count--;
++      pthread_cond_broadcast(&dev->submit_cond);
++   }
++   return NULL;
++}
++
++/* Queues a submission for the thread. Under dev->lock, so the queue is in sequence order; the
++ * thread never takes dev->lock. False if the thread couldn't start (the caller submits itself). */
++static bool
++ps4_queue_submission(ac_drm_device *dev, const struct ps4_submit_job *job)
++{
++   if (!dev->submit_thread_started) {
++      dev->submit_jobs = calloc(PS4_SUBMIT_QUEUE, sizeof(*dev->submit_jobs));
++      pthread_mutex_init(&dev->submit_mutex, NULL);
++      pthread_cond_init(&dev->submit_cond, NULL);
++      pthread_t thread;
++      if (!dev->submit_jobs || pthread_create(&thread, NULL, ps4_submit_thread, dev) != 0) {
++         free(dev->submit_jobs);
++         dev->submit_jobs = NULL;
++         return false;
++      }
++      pthread_detach(thread);
++      dev->submit_thread_started = true;
++      ps4_log("radv/ps4: submissions go to the GPU from their own thread\n");
++   }
++   pthread_mutex_lock(&dev->submit_mutex);
++   while (dev->submit_count == PS4_SUBMIT_QUEUE)
++      pthread_cond_wait(&dev->submit_cond, &dev->submit_mutex);
++   dev->submit_jobs[(dev->submit_head + dev->submit_count) % PS4_SUBMIT_QUEUE] = *job;
++   dev->submit_count++;
++   pthread_cond_broadcast(&dev->submit_cond);
++   pthread_mutex_unlock(&dev->submit_mutex);
++   return true;
++}
++
++/* Waits until the thread has handed everything queued to the GPU (before a submission that
++ * doesn't go through it). */
++static void
++ps4_drain_submissions(ac_drm_device *dev)
++{
++   if (!dev->submit_thread_started)
++      return;
++   pthread_mutex_lock(&dev->submit_mutex);
++   while (dev->submit_count != 0)
++      pthread_cond_wait(&dev->submit_cond, &dev->submit_mutex);
++   pthread_mutex_unlock(&dev->submit_mutex);
++}
++
++static int ac_drm_cs_submit_raw2_impl(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
++                                      int num_chunks, struct drm_amdgpu_cs_chunk *chunks,
++                                      uint64_t *seq_no);
++
+ int
+ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
+                       int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
++{
++   static void *site;
++   void *zone = ps4prof_enter(&site, "ps4: winsys submit");
++   const int result = ac_drm_cs_submit_raw2_impl(dev, ctx_id, bo_list_handle, num_chunks, chunks, seq_no);
++   ps4prof_leave(zone);
++   return result;
++}
++
++static int
++ac_drm_cs_submit_raw2_impl(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
++                           int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
+ {
+    void *dcb[64];
+    uint32_t dcb_sizes[64];
+@@ -2047,13 +2294,20 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+ 
+    /* A corrupted command buffer would hang the GPU (or fault it, and the system kills the app):
+     * drop its work - the fences still signal - and report it once. */
+-   for (unsigned i = 0; i < num_ibs; i++) {
+-      if (!ps4_check_ib_chain(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1)) {
+-         num_ibs = 0;
+-         break;
++#if PS4_WINSYS_DIAG
++   {
++      static void *site;
++      void *zone = ps4prof_enter(&site, "ps4: check IB chains");
++      for (unsigned i = 0; i < num_ibs; i++) {
++         if (!ps4_check_ib_chain(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1)) {
++            num_ibs = 0;
++            break;
++         }
+       }
++      ps4prof_leave(zone);
+    }
+    ps4_record_submission(dcb, dcb_sizes, num_ibs, dev->last_seq + 1);
++#endif
+ 
+    /* Commands that would write where they mustn't: report and disable them (RADV_PS4_SCAN=1;
+     * it found nothing in the boss-intro crash and costs CPU time). */
+@@ -2074,7 +2328,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+    while (dev->last_seq + 1 > FENCE_IB_COUNT &&
+           ps4_completed(dev) < dev->last_seq + 1 - FENCE_IB_COUNT) {
+       simple_mtx_unlock(&dev->lock);
++      static void *slot_site;
++      void *slot_zone = ps4prof_enter(&slot_site, "ps4: wait for a free fence slot (GPU behind)");
+       ps4_wait_seq(dev, dev->last_seq + 1 - FENCE_IB_COUNT, INT64_MAX);
++      ps4prof_leave(slot_zone);
+       simple_mtx_lock(&dev->lock);
+    }
+    ps4_account_gpu_time(dev);
+@@ -2131,13 +2388,27 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+       dcb_sizes[0] = (uint32_t)(t - ts_ib) * 4;
+       submit_ibs++;
+    }
+-   int r = dev->submit(submit_ibs, dcb, dcb_sizes, ccb, ccb_sizes);
+-   dev->submit_done();
+-   if (seq <= 40 || seq % 1000 == 0)
+-      ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
+-              "%llu memory writes checked, %u disabled\n",
+-              (unsigned long long)seq, num_ibs, dcb[0], dcb_sizes[0], r,
+-              (unsigned long long)ps4_completed(dev), ps4_writes_checked, ps4_bad_writes);
++   struct ps4_submit_job job = {
++      .seq = seq,
++      .user_fence_addr = user_fence_addr,
++      .num_ibs = submit_ibs,
++   };
++   memcpy(job.dcb, dcb, sizeof(dcb[0]) * submit_ibs);
++   memcpy(job.dcb_sizes, dcb_sizes, sizeof(dcb_sizes[0]) * submit_ibs);
++#if PS4_WINSYS_DIAG
++   for (unsigned i = 0; i < submit_ibs; i++)
++      ps4_chain_size(dcb[i], dcb_sizes[i] / 4, &job.chain_links, &job.chain_dwords);
++#endif
++   int r = 0;
++   if (!ps4_queue_submission(dev, &job)) {
++      /* No thread: submit here, as before. */
++      r = dev->submit(submit_ibs, dcb, dcb_sizes, ccb, ccb_sizes);
++      const int64_t now = os_time_get_nano();
++      if (now - dev->last_submit_done >= 8000000) {
++         dev->submit_done();
++         dev->last_submit_done = now;
++      }
++   }
+    if (r) {
+       ps4_log("radv/ps4: sceGnmSubmitCommandBuffers(%u IBs) = %#x\n", num_ibs + 1, r);
+       dev->last_seq--;
+@@ -2145,7 +2416,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+       return -EINVAL;
+    }
+ 
+-   if (seq % 256 == 0)
++   if (PS4_WINSYS_DIAG && seq % 256 == 0)
+       ps4_scan_tails(dev);
+    ps4_run_deferred(dev);
+ 
+@@ -2178,6 +2449,7 @@ ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg)
+    STATIC_ASSERT(ARRAY_SIZE(dev->flip_seq) * FLIP_IB_DW * 4 <= PS4_PAGE);
+ 
+    simple_mtx_lock(&dev->lock);
++   ps4_drain_submissions(dev);
+    const unsigned slot = dev->flip_count % ARRAY_SIZE(dev->flip_seq);
+    /* The slot's previous flip IB, and the fence IB slot for the next sequence number, must be
+     * free - waited for before taking the number, as in ac_drm_cs_submit_raw2. */
+@@ -2400,18 +2672,27 @@ ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigne
+    }
+ }
+ 
++/* Like libdrm's drmSyncobjWait, a failed wait also leaves its error in errno: Mesa tells a
++ * timeout from a failure by errno == ETIME (vk_drm_syncobj.c), as a poll with timeout 0 does on
++ * every frame (Dawn's fence checks). */
+ static int
+ ps4_wait(struct util_sync_provider *p, uint32_t *handles, unsigned count, int64_t timeout_nsec,
+          unsigned flags, uint32_t *first)
+ {
+-   return ps4_wait_common((ac_drm_device *)p, handles, NULL, count, timeout_nsec, flags, first);
++   const int r = ps4_wait_common((ac_drm_device *)p, handles, NULL, count, timeout_nsec, flags, first);
++   if (r < 0)
++      errno = -r;
++   return r;
+ }
+ 
+ static int
+ ps4_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
+                   unsigned count, int64_t timeout_nsec, unsigned flags, uint32_t *first)
+ {
+-   return ps4_wait_common((ac_drm_device *)p, handles, points, count, timeout_nsec, flags, first);
++   const int r = ps4_wait_common((ac_drm_device *)p, handles, points, count, timeout_nsec, flags, first);
++   if (r < 0)
++      errno = -r;
++   return r;
+ }
+ 
+ static int
+diff --git a/port/ps4_runtime.cpp b/port/ps4_runtime.cpp
+index 29a060f..59b2c3a 100644
+--- a/port/ps4_runtime.cpp
++++ b/port/ps4_runtime.cpp
+@@ -323,7 +323,17 @@ const char* g_prevOp = "none";
+ const void* g_prevCaller = nullptr;
+ bool g_heapBroken = false;
+ 
++#ifndef PS4_HEAP_CHECKS
++#define PS4_HEAP_CHECKS 1
++#endif
++
+ void checkHeap(const char* op, const void* caller) {
++#if !PS4_HEAP_CHECKS
++    // Release builds: no check on every allocation (shared counters every thread writes).
++    (void)op;
++    (void)caller;
++    return;
++#endif
+     g_ops++;
+     if (g_heap && !g_heapBroken && !ps4_heap_ok(g_heap)) {
+         g_heapBroken = true;
+diff --git a/scripts/build-bisect.sh b/scripts/build-bisect.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/build-dolphin.sh b/scripts/build-dolphin.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/build-gnm-probe.sh b/scripts/build-gnm-probe.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/build-mesa.sh b/scripts/build-mesa.sh
+old mode 100644
+new mode 100755
+index 6a7250c..f83ca8b
+--- a/scripts/build-mesa.sh
++++ b/scripts/build-mesa.sh
+@@ -11,7 +11,10 @@ source "$HERE/ps4-env.sh"
+ ROOT="$PS4_BUILD_ROOT"
+ SYSROOT="${PS4_SYSROOT:-$ROOT/sysroot}"
+ MESA="$ROOT/src/mesa"
+-build="$ROOT/build/mesa"
++build="${MESA_BUILD:-$ROOT/build/mesa}"
++# Extra meson array items for the compiler and the linker (PGO: tools/build-mesa.sh).
++extra_flags="${MESA_EXTRA_FLAGS:-}"
++extra_link="${MESA_EXTRA_LINK:-}"
+ export PATH="$ROOT/mesa-venv/bin:$ROOT/host-tools/bin:$PATH"
+ 
+ # Header-only libdrm / libdrm_amdgpu packages for meson's dependency() checks.
+@@ -32,11 +35,12 @@ flags="'-target', 'x86_64-pc-freebsd12-elf', '-D_GNU_SOURCE', '-D__PS4__', '-D__
+   '-D__ORBIS__', '-DPS4', '-D__BSD_VISIBLE', '-D_BSD_SOURCE', '-fPIC', '-funwind-tables',
+   '-march=btver2', '-isysroot', '$OPENORBIS', '-isystem', '$SYSROOT/libc-overlay',
+   '-isystem', '$HERE/../port/mesa-overlay', '-I$ROOT/src/libdrm', '-I$ROOT/src/libdrm/include/drm',
+-  '-isystem', '$OPENORBIS/include', '-I$OPENORBIS/usr/include'"
++  '-isystem', '$OPENORBIS/include', '-I$OPENORBIS/usr/include'$extra_flags"
+ link="'-fuse-ld=$OPENORBIS/bin/ld.lld', '-nostdlib', '-Wl,-m,elf_x86_64', '-Wl,-pie',
+   '-Wl,--eh-frame-hdr', '-Wl,--script,$OPENORBIS/link.x', '-L$OPENORBIS/lib',
+-  '$OPENORBIS/lib/crt1.o', '-lkernel', '-lc', '-lclang_rt.builtins-x86_64', '-lSceLibcInternal'"
++  '$OPENORBIS/lib/crt1.o'$extra_link, '-lkernel', '-lc', '-lclang_rt.builtins-x86_64', '-lSceLibcInternal'"
+ cross="$ROOT/mesa-ps4-cross.ini"
++[ "$build" = "$ROOT/build/mesa" ] || cross="$build-cross.ini"
+ cat > "$cross" <<EOF
+ [binaries]
+ c = 'clang-21'
+diff --git a/scripts/build-probe.sh b/scripts/build-probe.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/build-vk-probe.sh b/scripts/build-vk-probe.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/configure-dolphin.sh b/scripts/configure-dolphin.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/crashlog.sh b/scripts/crashlog.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/make-pkg.sh b/scripts/make-pkg.sh
+old mode 100644
+new mode 100755
+index d58df56..a6f3897
+--- a/scripts/make-pkg.sh
++++ b/scripts/make-pkg.sh
+@@ -66,6 +66,7 @@ set_entry VERSION Utf8 8 "$VERSION"
+ rm -f "$STAGE/pkg.gp4"
+ ( cd "$STAGE" && "$TOOLS/create-gp4" -out pkg.gp4 --content-id="$CONTENT_ID" --path . ) >/dev/null
+ mkdir -p "$OUT"
+-( cd "$STAGE" && "$TOOLS/PkgTool.Core" pkg_build pkg.gp4 "$OUT" ) >/dev/null
++# PS4_PKGTOOL: another PkgTool.Core (Dusklight's patched build for multi-GB packages).
++( cd "$STAGE" && "${PS4_PKGTOOL:-$TOOLS/PkgTool.Core}" pkg_build pkg.gp4 "$OUT" ) >/dev/null
+ rm -f "$STAGE/pkg.gp4"
+ echo "$OUT/$CONTENT_ID.pkg"
+diff --git a/scripts/package-dolphin.sh b/scripts/package-dolphin.sh
+old mode 100644
+new mode 100755
+diff --git a/scripts/ps4-env.sh b/scripts/ps4-env.sh
+old mode 100644
+new mode 100755
+diff --git a/toolchain/bin/ps4-c++ b/toolchain/bin/ps4-c++
+old mode 100644
+new mode 100755
+diff --git a/toolchain/bin/ps4-cc b/toolchain/bin/ps4-cc
+old mode 100644
+new mode 100755
+diff --git a/toolchain/build-libcxx.sh b/toolchain/build-libcxx.sh
+old mode 100644
+new mode 100755
+diff --git a/toolchain/build-runtime.sh b/toolchain/build-runtime.sh
+old mode 100644
+new mode 100755
+diff --git a/toolchain/env.sh b/toolchain/env.sh
+old mode 100644
+new mode 100755
+diff --git a/toolchain/patch-crt1.sh b/toolchain/patch-crt1.sh
+old mode 100644
+new mode 100755
+diff --git a/toolchain/prepare-sysroot.sh b/toolchain/prepare-sysroot.sh
+old mode 100644
+new mode 100755

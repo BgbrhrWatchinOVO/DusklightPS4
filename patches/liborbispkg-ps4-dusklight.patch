@@ -1,0 +1,43 @@
+diff --git a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+index 5c5ed80..7682ab6 100644
+--- a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
++++ b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+@@ -1,7 +1,7 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>net6.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <RootNamespace>LibOrbisPkg</RootNamespace>
+     <LangVersion>7.3</LangVersion>
+     <Platforms>AnyCPU</Platforms>
+diff --git a/LibOrbisPkg/PKG/PkgBuilder.cs b/LibOrbisPkg/PKG/PkgBuilder.cs
+index e6bd02c..05b501d 100644
+--- a/LibOrbisPkg/PKG/PkgBuilder.cs
++++ b/LibOrbisPkg/PKG/PkgBuilder.cs
+@@ -433,7 +433,11 @@ namespace LibOrbisPkg.PKG
+             0x80000) + pfsSize;
+           // Add the size of the chunk SHAs, plus an extra 16 bytes for good measure
+           pkgSize += ((pkgSize + 16) / 0x10000) * 4;
+-          e.DataSize = (uint)(pkgSize / 0x10000L) * 4;
++          // The estimate falls short for multi-GB packages (the PFS image ends up larger than
++          // pfsSize): reserve 1/8 more chunks plus 16384 (1 GiB of PKG); the size is set to the
++          // exact one once the PKG size is known (below).
++          long chunks = pkgSize / 0x10000L;
++          e.DataSize = (uint)((chunks + chunks / 8 + 0x4000) * 4);
+         }
+ 
+         dataOffset = Align(dataOffset + e.DataSize, 16);
+diff --git a/PkgTool.Core/PkgTool.Core.csproj b/PkgTool.Core/PkgTool.Core.csproj
+index d3efb7e..147a94f 100644
+--- a/PkgTool.Core/PkgTool.Core.csproj
++++ b/PkgTool.Core/PkgTool.Core.csproj
+@@ -2,7 +2,7 @@
+ 
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+-    <TargetFramework>net6.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <StartupObject>PkgTool.Program</StartupObject>
+     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

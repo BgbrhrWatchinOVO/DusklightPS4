@@ -1,0 +1,33 @@
+diff --git a/src/log.cpp b/src/log.cpp
+index c2a0343..73cc43e 100644
+--- a/src/log.cpp
++++ b/src/log.cpp
+@@ -289,6 +289,14 @@ std::string make_timestamped_log_name(const std::string& prefix, unsigned attemp
+ FILE* open_log_file(const std::filesystem::path& path) {
+ #if defined(_WIN32)
+     return _wfopen(path.c_str(), L"wbx");
++#elif defined(__ORBIS__)
++    // The PS4 closes a title without running exit handlers: write each line as it comes, or
++    // everything after the first buffer is lost.
++    FILE* file = std::fopen(path.c_str(), "wbx");
++    if (file != nullptr) {
++        std::setvbuf(file, nullptr, _IOLBF, 4096);
++    }
++    return file;
+ #else
+     return std::fopen(path.c_str(), "wbx");
+ #endif
+@@ -369,6 +377,13 @@ void write_file(State& state, const Message& message, bool flushLine) {
+         return;
+     }
+     const std::string_view levelStr = to_string(message.level);
++#if defined(__ORBIS__)
++    // PS4 builds: seconds since start, to time startup and scene loads from the console's logs.
++    static const auto start = std::chrono::steady_clock::now();
++    const double elapsed =
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++    std::fprintf(state.file, "%9.3f ", elapsed);
++#endif
+     std::fprintf(state.file, "[%.*s | %.*s] ", static_cast<int>(levelStr.size()), levelStr.data(),
+         static_cast<int>(message.module.size()), message.module.data());
+     std::fwrite(message.text.data(), 1, message.text.size(), state.file);
