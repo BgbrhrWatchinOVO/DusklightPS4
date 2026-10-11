@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dusklight for PS4 – Manual</title>
+<style>
+:root { --bg:#f4f1ea; --card:#fff; --text:#22201c; --muted:#6b655b; --line:#ddd6c8; --accent:#c9781a; --code:#f1ece2; }
+@media (prefers-color-scheme: dark) { :root { --bg:#15141a; --card:#1f1d26; --text:#ece8df; --muted:#a39d92; --line:#34313d; --accent:#e8a13c; --code:#2a2733; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+main { max-width:820px; margin:0 auto; padding:24px 16px 48px; }
+header { border-bottom:3px solid var(--accent); margin-bottom:24px; padding-bottom:12px; }
+h1 { margin:0; font-size:28px; } .sub { color:var(--muted); margin:4px 0 0; }
+h2 { margin-top:36px; font-size:21px; } h3 { font-size:17px; margin-bottom:4px; }
+section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:4px 22px 16px; margin:16px 0; }
+code, kbd { background:var(--code); border-radius:5px; padding:1px 6px; font-size:.92em; overflow-wrap:anywhere; }
+table { border-collapse:collapse; width:100%; } td, th { border-top:1px solid var(--line); padding:8px 6px; text-align:left; vertical-align:top; }
+th { color:var(--muted); font-weight:600; } ol li, ul li { margin:6px 0; }
+.note { border-left:3px solid var(--accent); padding:4px 12px; color:var(--muted); }
+nav ol { columns:2; } @media (max-width:600px) { nav ol { columns:1; } }
+a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Dusklight for PS4</h1>
+  <p class="sub">The Legend of Zelda: Twilight Princess as a native PS4 program · Player manual · Release r25, Setup Studio 0.2.0</p>
+</header>
+
+<nav><ol>
+  <li><a href="#what">What is this?</a></li>
+  <li><a href="#need">What you need</a></li>
+  <li><a href="#start">Start the Setup Studio</a></li>
+  <li><a href="#steps">The assistant, step by step</a></li>
+  <li><a href="#install">Installing on the PS4</a></li>
+  <li><a href="#controls">Controls</a></li>
+  <li><a href="#update">Updating, saves and backups</a></li>
+  <li><a href="#trouble">Troubleshooting</a></li>
+  <li><a href="#legal">Legal</a></li>
+</ol></nav>
+
+<h2 id="what">What is this?</h2>
+<section>
+<p><em>The Legend of Zelda: Twilight Princess</em> as a real PS4 program, not an emulator. It is based on
+<strong>Dusklight</strong>, the PC port of the game's fan decompilation. On the PS4 it runs at up to 60 FPS,
+optionally with HD textures, with PlayStation buttons and the Wii U-style HUD (Twilight HD).</p>
+<p><strong>This folder contains no game data.</strong> You bring your own game; the Setup Studio builds a package
+with it for your PS4.</p>
+</section>
+
+<h2 id="need">What you need</h2>
+<section>
+<table>
+  <tr><th>The game files</th><td>Your own disc, dumped as an <code>.iso</code>. <strong>GameCube</strong> (GZ2E01, GZ2P01, GZ2J01) works directly,
+    nothing else needed. <strong>Wii</strong> (RZDE01, RZDP01, RZDJ01) works directly when decrypted; an <strong>encrypted Wii dump</strong>
+    (as CleanRip makes it) works together with your Wii key. WBFS/RVZ files and the Wii U HD version cannot be used.<br>
+    How to dump your own disc: <a href="https://wii.hacks.guide/dump-games.html">wii.hacks.guide/dump-games.html</a>
+    (with <a href="https://github.com/emukidid/cleanrip">CleanRip</a>)</td></tr>
+  <tr><th>Wii key (encrypted Wii dumps only)</th><td>Paste your Wii's common key (32 hexadecimal characters) into the assistant, or give it
+    the <code>keys.bin</code> that BootMii writes to the SD card together with a NAND backup of your own Wii:
+    <a href="https://wii.hacks.guide/nand-backup.html">wii.hacks.guide/nand-backup.html</a>. The Setup Studio contains no Nintendo keys.</td></tr>
+  <tr><th>The textures (optional)</th><td>Henriko's "Twilight Princess 4K" pack, <strong>1080p version for Dusklight (PC)</strong>, and optionally the
+    "Xbox + PS UI Buttons Addon" (PC) for PlayStation symbols on all buttons. <strong>Both are on Henriko's page.</strong> ZIP or extracted folder, both work:
+    <a href="https://www.henrikomagnifico.com/zelda-twilight-princess-4k">henrikomagnifico.com/zelda-twilight-princess-4k</a>.
+    The 4K version needs far more graphics memory and can stutter.</td></tr>
+  <tr><th>PS4 or PS4 Pro</th><td>with GoldHEN (homebrew enabled)</td></tr>
+  <tr><th>Computer</th><td>Windows (64-bit), macOS (Apple silicon or Intel) or Linux (64-bit). Nothing to install: everything the Setup Studio needs is in this folder.</td></tr>
+</table>
+<p class="note">Without the texture pack the game runs with its original textures; the HD textures are purely an extra.</p>
+</section>
+
+<h2 id="start">Start the Setup Studio</h2>
+<section>
+<p>Double-click the file for your system in the release folder:</p>
+<table>
+  <tr><th>Windows</th><td><code>Dusklight Setup Studio (Windows).bat</code></td></tr>
+  <tr><th>macOS</th><td><code>Dusklight Setup Studio (macOS).command</code>. The first time: right-click → "Open" → "Open". The window app is
+    then unpacked once into your Application Support folder, which takes a moment.</td></tr>
+  <tr><th>Linux</th><td><code>Dusklight Setup Studio (Linux).sh</code>. If a text editor opens instead, run <code>sh "Dusklight Setup Studio (Linux).sh"</code> in a terminal.</td></tr>
+</table>
+<p>The assistant opens in its own window. If the window app cannot start, the launcher opens the assistant in your browser instead;
+everything works the same, only files you drag in are copied into the work folder first.</p>
+<p class="note">If nothing starts at all, copy the whole release folder to your computer and start it from there;
+some systems do not run programs straight from a USB stick.</p>
+</section>
+
+<h2 id="steps">The assistant, step by step</h2>
+<section>
+<ol>
+  <li><strong>Game:</strong> drag your <code>.iso</code> (GameCube or Wii) into the window, or choose it with "Browse…". It shows the game,
+    version and region. If it is an encrypted Wii dump, the section <em>"Wii dump? Add your Wii key"</em> opens: paste your Wii key there,
+    or drag in your <code>keys.bin</code>. The key is only used on your computer and never saved.</li>
+  <li><strong>HD textures (optional):</strong> drag the texture pack and the button addon into the window, folders or ZIPs, together or one
+    by one; the assistant tells them apart. Or "Without textures".</li>
+  <li><strong>Settings:</strong> first how to install: a <strong>complete package</strong> (recommended, no FTP needed) or sending everything to the
+    PS4 over FTP. Then the game language (every language your disc offers), the Wii U-style HUD, faster scene transitions, and the
+    version: <em>Dusklight</em> (recommended) or <em>Dusklight Dev</em> (frame counter and tools for troubleshooting).</li>
+  <li><strong>PS4</strong> (FTP only): switch on GoldHEN's FTP server, enter the PS4's IP address and "Test connection".</li>
+  <li><strong>Build / Install:</strong> the assistant makes your image smaller (a 4.4 GB Wii disc becomes about 1.1 GB; an encrypted
+    dump is decrypted on the way; every file is checked), converts the textures, and builds the package or sends everything to the PS4.
+    A complete package is about 3 GB, takes a minute or a few, and is saved in the folder you started the Setup Studio from.</li>
+</ol>
+</section>
+
+<h2 id="install">Installing on the PS4</h2>
+<section>
+<h3>Complete package</h3>
+<ol>
+  <li>The Setup Studio saves <code>Dusklight-Complete.pkg</code> in the folder you started it from (where the launchers are).</li>
+  <li>Copy <code>Dusklight-Complete.pkg</code> to the top folder of a USB drive formatted as exFAT.</li>
+  <li>Plug the drive into the PS4 and install the package with the Package Installer
+    (<strong>Settings → Debug Settings → Game → Package Installer</strong>, available with GoldHEN).</li>
+  <li>Start <strong>Dusklight</strong> from the home screen.</li>
+</ol>
+<p class="note">The settings you chose apply when Dusklight starts for the first time. If Dusklight was set up on this PS4 before, it keeps
+its existing settings; change them in the Dusklight menu (touchpad).</p>
+<h3>Over FTP</h3>
+<ol>
+  <li>After the assistant has finished, open <strong>GoldHEN → Package Installer</strong> on the PS4 and install <code>Dusklight.pkg</code>
+    (or <code>Dusklight-Dev.pkg</code>).</li>
+  <li>Start <strong>Dusklight</strong> from the home screen.</li>
+</ol>
+</section>
+
+<h2 id="controls">Controls</h2>
+<section>
+<p>The buttons sit where they are on the Nintendo controller, with PlayStation symbols:</p>
+<table>
+  <tr><th>Circle</th><td>A – confirm, action</td></tr>
+  <tr><th>Cross</th><td>B – back, sword</td></tr>
+  <tr><th>Triangle / Square</th><td>X / Y – items</td></tr>
+  <tr><th>Touchpad</th><td>Dusklight menu (settings, graphics, HD textures on/off)</td></tr>
+</table>
+</section>
+
+<h2 id="update">Updating, saves and backups</h2>
+<section>
+<ul>
+  <li>For a new version, run the Setup Studio of the new release again and install the new package. Your saves are kept.</li>
+  <li>Saves and settings live on the PS4 in <code>/data/dusklight-ps4/user/</code>, separate from the program; reinstalling does not delete them.</li>
+  <li>The FTP way backs that folder up to your computer first, into <code>DskStudioC06f/backups/</code> in your home folder.</li>
+  <li><code>DskStudioC06f</code> also keeps the smaller image and the converted texture pack, so a second run is quick. Delete the folder
+    whenever you need the space.</li>
+</ul>
+</section>
+
+<h2 id="trouble">Troubleshooting</h2>
+<section>
+<table>
+  <tr><th>Problem</th><th>Solution</th></tr>
+  <tr><td>"This Wii image is encrypted"</td><td>Add your Wii key in the section "Wii dump? Add your Wii key": paste it, or drag in your <code>keys.bin</code> (BootMii backup).</td></tr>
+  <tr><td>"This Wii key does not fit the disc"</td><td>It is not the Wii's common key; take the keys.bin BootMii wrote next to <code>nand.bin</code>.</td></tr>
+  <tr><td>The image is rejected</td><td>The message says why: usually a WBFS/RVZ file, which has to be converted to an ISO first.</td></tr>
+  <tr><td>"No connection to the PS4" (FTP)</td><td>Is GoldHEN's FTP server on? Is the IP right? Are both in the same network? Some guest Wi-Fi networks keep devices apart.</td></tr>
+  <tr><td>Game does not start, black screen</td><td>Restart the PS4 completely and try again.</td></tr>
+  <tr><td>Error CE-34878-0 (crash)</td><td>Restart the PS4 <strong>completely</strong>, not just rest mode; otherwise the game can run very slowly afterwards.
+    If it happens again, play with <em>Dusklight Dev</em> and send its logs to the developers.</td></tr>
+  <tr><td>No HD textures</td><td>In the Dusklight menu (touchpad), check under graphics that texture replacement is on.</td></tr>
+  <tr><td>Disc check notice at start</td><td>Normal for decrypted Wii images: choose "Continue anyway".</td></tr>
+</table>
+</section>
+
+<h2 id="legal">Legal</h2>
+<section>
+<ul>
+  <li>Fan project, not affiliated with Nintendo. "The Legend of Zelda" and "Twilight Princess" are trademarks of Nintendo.</li>
+  <li>You need your own, legally obtained copy of the game. A package built with it is for you alone; do not pass on packages,
+    images or textures that contain game data. The Setup Studio contains no game data and no Nintendo keys.</li>
+  <li>The PS4 program is licensed under the GPL-3.0. The licence texts of all components and the source code are in the
+    <code>Notices</code> folder. The texture pack belongs to Henriko and is only downloaded from his page.</li>
+</ul>
+</section>
+</main>
+</body>
+</html>
