@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dusklight Setup Studio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◐</span>
+    <div>
+      <h1>Dusklight Setup Studio</h1>
+      <p class="sub" data-i18n="subtitle">Twilight Princess on your PS4, with your own game</p>
+    </div>
+  </div>
+</header>
+
+<nav class="steps" aria-label="Steps">
+  <ol>
+    <li data-step="0" data-i18n="stepWelcome">Welcome</li>
+    <li data-step="1" data-i18n="stepGame">Game</li>
+    <li data-step="2" data-i18n="stepTextures">HD textures</li>
+    <li data-step="3" data-i18n="stepSettings">Settings</li>
+    <li data-step="4" data-i18n="stepPs4">PS4</li>
+    <li data-step="5" data-i18n="stepInstall">Install</li>
+  </ol>
+</nav>
+
+<main>
+  <!-- 0 Welcome -->
+  <section class="card" data-page="0">
+    <h2 data-i18n="welcomeTitle">Welcome</h2>
+    <p data-i18n="thanks1">This port stands on the work of many people. Thank you to everyone whose work and ideas made it possible, including the artists, programmers, writers and scientists behind the modern tools it was built with. Ideas, code and AI should be free, shared and open to everyone.</p>
+    <p data-i18n="thanks2">Thank you to the developers of The Legend of Zelda: Twilight Princess for a game that is still loved today.</p>
+    <p data-i18n="thanks3">Thank you to the community around the game, especially the developers of Dusklight and everyone who worked on the decompilation, the PS5 port, DolphinPS4 and Twilight HD.</p>
+    <p data-i18n="thanks4">This port exists because of their work. Have a lot of fun with it.</p>
+    <div class="cols">
+      <div>
+        <h3 data-i18n="needTitle">What you need</h3>
+        <ul>
+          <li><span data-i18n="needGame">The game files</span>: <a href="#" data-open="dump" data-i18n="linkDump">dump your own disc (guide)</a></li>
+          <li><span data-i18n="needTextures">The textures</span>: <a href="#" data-open="henriko" data-i18n="linkHenriko">Henriko's download page</a>
+            <span class="muted" data-i18n="needTexturesNote">(the HD texture pack and the PlayStation buttons addon are both on this page)</span></li>
+        </ul>
+      </div>
+      <div>
+        <h3 data-i18n="doesTitle">What the script does</h3>
+        <ul>
+          <li data-i18n="does1">Runs on Linux, Windows, and macOS, with a GUI</li>
+          <li data-i18n="does2">Asks which language you want and whether to install improved textures</li>
+          <li data-i18n="does3">Builds a ready-to-install package</li>
+        </ul>
+      </div>
+    </div>
+    <p data-i18n="tip">If you enjoy it, please consider supporting the developers mentioned above; any amount helps. Feedback about bugs, errors, misconfigurations or possible improvements is welcome.</p>
+    <p class="signoff" data-i18n="signoff">Have fun, and good luck!</p>
+    <p class="note" data-i18n="legal">Game data belongs to Nintendo and the texture pack's author asks that it is only downloaded from his page, so you bring both yourself. Everything stays on your computer and your PS4; nothing is uploaded anywhere else.</p>
+    <div class="actions"><button type="button" class="primary" data-next data-i18n="start">Start</button></div>
+  </section>
+
+  <!-- 1 Game -->
+  <section class="card" data-page="1" data-drop="image" hidden>
+    <h2 data-i18n="gameTitle">Choose your game</h2>
+    <p data-i18n="gameIntro">Twilight Princess for GameCube or for Wii: both work. Choose the .iso of your own disc.</p>
+    <div class="cols platforms">
+      <div class="platform">
+        <h3 data-i18n="gcTitle">GameCube</h3>
+        <p data-i18n="gcText">Works directly. Nothing else needed.</p>
+        <p class="muted" data-i18n="gcIds">GZ2E01 (USA) · GZ2P01 (Europe, 5 languages) · GZ2J01 (Japan)</p>
+      </div>
+      <div class="platform">
+        <h3 data-i18n="wiiTitle">Wii</h3>
+        <p data-i18n="wiiText">A decrypted image works directly. An encrypted dump (as CleanRip makes it) needs your Wii key: add it below.</p>
+        <p class="muted" data-i18n="wiiIds">RZDE01 (USA) · RZDP01 (Europe, 5 languages) · RZDJ01 (Japan)</p>
+      </div>
+    </div>
+    <div class="picker" data-drop="image">
+      <input type="text" id="image" spellcheck="false" placeholder="…/game.iso">
+      <button type="button" data-browse="image" data-target="image" data-i18n="browse">Browse…</button>
+    </div>
+    <p class="drop-hint" data-i18n="dropHintImage">or drag the file into this window</p>
+    <p class="drop-hint"><a href="#" data-open="dump" data-i18n="linkDumpLong">How to dump your own disc with CleanRip</a> · <a href="#" data-open="cleanrip">CleanRip</a></p>
+    <div id="imageResult" class="result" role="status" aria-live="polite"></div>
+    <details id="wiiKey" class="sub">
+      <summary data-i18n="wiiKeyTitle">Wii dump? Add your Wii key</summary>
+      <p data-i18n="wiiKeyText">Only needed for an encrypted Wii dump. Paste your Wii's common key, or choose the keys.bin from your own Wii's BootMii backup. The key is only used to decrypt your disc on this computer and is never saved.</p>
+      <label class="field">
+        <span data-i18n="keyPasteLabel">Wii common key (32 hexadecimal characters)</span>
+        <input type="text" id="keyText" class="mono" autocomplete="off" spellcheck="false" placeholder="00112233445566778899aabbccddeeff">
+      </label>
+      <p class="or" data-i18n="or">or</p>
+      <label class="field">
+        <span data-i18n="keysLabel">keys.bin from your own BootMii backup</span>
+        <div class="picker" data-drop="keys">
+          <input type="text" id="keys" spellcheck="false" placeholder="…/keys.bin">
+          <button type="button" data-browse="keys" data-target="keys" data-i18n="browse">Browse…</button>
+        </div>
+      </label>
+      <div class="actions left"><button type="button" id="applyKey" data-i18n="applyKey">Use this key</button></div>
+      <p class="drop-hint" data-i18n="keysHint">The Setup Studio contains no Nintendo keys. BootMii writes keys.bin together with its NAND backup (nand.bin) to the SD card; the common key is also shown by tools that read keys.bin.</p>
+      <p class="drop-hint"><a href="#" data-open="nand" data-i18n="linkNand">How to make a BootMii backup (keys.bin)</a></p>
+    </details>
+    <div class="actions">
+      <button type="button" data-back data-i18n="back">Back</button>
+      <button type="button" class="primary" id="imageNext" data-i18n="next" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- 2 Textures -->
+  <section class="card" data-page="2" data-drop="auto" hidden>
+    <h2 data-i18n="texTitle">HD textures (optional)</h2>
+    <p data-i18n="texText">Henriko's texture pack makes the game sharper. Download the 1080p version for Dusklight (PC) from his page, then choose the ZIP or its extracted folder here.</p>
+    <div class="actions left"><button type="button" id="openHenriko" data-open="henriko" data-i18n="openHenriko">Open Henriko's download page</button></div>
+    <label class="field">
+      <span data-i18n="texPack">Texture pack (ZIP or folder)</span>
+      <div class="picker" data-drop="pack">
+        <input type="text" id="pack" spellcheck="false">
+        <button type="button" data-browse="pack" data-target="pack" data-i18n="browse">Browse…</button>
+      </div>
+    </label>
+    <div id="packResult" class="result" role="status" aria-live="polite"></div>
+    <label class="field">
+      <span data-i18n="texButtons">PlayStation buttons addon (optional, ZIP or folder, PC version), also on Henriko's page</span>
+      <div class="picker" data-drop="buttons">
+        <input type="text" id="buttons" spellcheck="false">
+        <button type="button" data-browse="zip" data-target="buttons" data-i18n="browse">Browse…</button>
+      </div>
+    </label>
+    <div id="buttonsResult" class="result" role="status" aria-live="polite"></div>
+    <p class="drop-hint" data-i18n="dropHintTextures">Tip: drag the texture pack and the button addon (folders or ZIPs) into this window, together or one by one.</p>
+    <div class="actions">
+      <button type="button" data-back data-i18n="back">Back</button>
+      <button type="button" id="skipTextures" data-i18n="skip">Without textures</button>
+      <button type="button" class="primary" id="texNext" data-i18n="next" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- 3 Settings -->
+  <section class="card" data-page="3" hidden>
+    <h2 data-i18n="setTitle">Settings</h2>
+    <fieldset class="method">
+      <legend data-i18n="setMethod">How to install</legend>
+      <label class="check"><input type="radio" name="method" value="package" checked> <span data-i18n="setPackage">Build a complete package: game, textures and settings in one file, no FTP needed (recommended)</span></label>
+      <label class="check"><input type="radio" name="method" value="ftp"> <span data-i18n="setFtp">Send everything to the PS4 over FTP</span></label>
+    </fieldset>
+    <label class="field">
+      <span data-i18n="setLanguage">Game language</span>
+      <select id="language"></select>
+    </label>
+    <label class="check"><input type="checkbox" id="hud" checked> <span data-i18n="setHud">Wii U-style HUD (Twilight HD)</span></label>
+    <label class="check"><input type="checkbox" id="fast" checked> <span data-i18n="setFast">Faster scene transitions</span></label>
+    <fieldset>
+      <legend data-i18n="setVersion">Version</legend>
+      <label class="check"><input type="radio" name="version" value="release" checked> <span data-i18n="setRelease">Dusklight (recommended)</span></label>
+      <label class="check"><input type="radio" name="version" value="dev"> <span data-i18n="setDev">Dusklight Dev: frame counter, profiler and logs for troubleshooting</span></label>
+    </fieldset>
+    <div class="actions">
+      <button type="button" data-back data-i18n="back">Back</button>
+      <button type="button" class="primary" data-next data-i18n="next">Next</button>
+    </div>
+  </section>
+
+  <!-- 4 PS4 -->
+  <section class="card" data-page="4" hidden>
+    <h2 data-i18n="ps4Title">Connect to your PS4</h2>
+    <p data-i18n="ps4Text">Switch on GoldHEN's FTP server on the PS4 and enter its IP address (GoldHEN shows it when FTP starts).</p>
+    <div class="picker">
+      <input type="text" id="host" inputmode="decimal" placeholder="192.168.0.20" spellcheck="false">
+      <button type="button" id="testPs4" data-i18n="test">Test connection</button>
+    </div>
+    <div id="ps4Result" class="result" role="status" aria-live="polite"></div>
+    <div class="actions">
+      <button type="button" data-back data-i18n="back">Back</button>
+      <button type="button" class="primary" id="ps4Next" data-i18n="next" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- 5 Install -->
+  <section class="card" data-page="5" hidden>
+    <h2 data-i18n="insTitle">Install</h2>
+    <dl id="summary" class="summary"></dl>
+    <p class="note" id="insNote"></p>
+    <div class="actions" id="insActions">
+      <button type="button" data-back data-i18n="back">Back</button>
+      <button type="button" class="primary" id="install" data-i18n="install">Install on the PS4</button>
+    </div>
+    <div id="progress" hidden>
+      <ul class="progress" id="progressList"></ul>
+      <pre id="log" class="log" aria-live="polite"></pre>
+    </div>
+    <div id="done" class="result ok" hidden></div>
+    <div id="failed" class="result bad" hidden></div>
+  </section>
+</main>
+
+<dialog id="browser">
+  <form method="dialog" class="browser">
+    <h3 data-i18n="browseTitle">Choose</h3>
+    <div class="picker">
+      <button type="button" id="browseUp" aria-label="Up">↑</button>
+      <input type="text" id="browsePath" spellcheck="false">
+      <button type="button" id="browseGo" data-i18n="go">Go</button>
+    </div>
+    <div id="drives" class="drives"></div>
+    <ul id="browseList" class="files"></ul>
+    <div class="actions">
+      <button type="button" id="browseNative" data-i18n="native">System dialog…</button>
+      <button type="button" id="browseFolder" data-i18n="useFolder" hidden>Use this folder</button>
+      <button value="cancel" data-i18n="cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<footer class="foot">
+  <span data-i18n="footer">Fan project, not affiliated with Nintendo. The package you install is for your own use only.</span>
+  <span id="version"></span>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>
